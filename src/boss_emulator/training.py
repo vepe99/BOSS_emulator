@@ -47,6 +47,27 @@ from boss_emulator.emulator import build_model
 
 
 # =========================================================================
+# GPU claim
+# =========================================================================
+
+def claim_gpu() -> None:
+    """Force JAX to initialise on the autocvd-selected GPU *now*.
+
+    ``autocvd`` (run at import, above) only sets ``CUDA_VISIBLE_DEVICES``;
+    JAX would not otherwise touch the device until the first train step --
+    which is *after* the minutes-long CPU dataset load. Touching the device
+    here initialises the CUDA context and claims the free GPU up front, so it
+    can't be grabbed by another process during that load, and surfaces the
+    device choice immediately. No-op cost is negligible.
+    """
+    backend = jax.default_backend()
+    devices = jax.devices()
+    # A trivial op forces the backend to initialise and allocate the device.
+    jax.device_put(0.0).block_until_ready()
+    print(f"[gpu] JAX backend={backend}  devices={devices}", flush=True)
+
+
+# =========================================================================
 # Train / eval steps
 # =========================================================================
 
@@ -106,8 +127,11 @@ def train(args) -> Path:
             model_kwargs["branch_hidden"] = tuple(args.hidden)
     if args.model == "deeponet":
         model_kwargs["latent"] = args.latent
+    if args.dropout:
+        model_kwargs["dropout"] = args.dropout
     model = build_model(
         args.model, ds.n_features, ds.n_pixels, seed=args.seed, **model_kwargs)
+    model.train()  # enable dropout during training (no-op when dropout=0)
 
     steps_per_epoch = max(1, ds.train_idx.size // args.batch_size)
     total_steps = steps_per_epoch * args.epochs
@@ -116,7 +140,9 @@ def train(args) -> Path:
         warmup_steps=min(500, total_steps // 20 + 1),
         decay_steps=total_steps, end_value=args.lr * 0.01,
     )
-    optimizer = nnx.Optimizer(model, optax.adam(schedule), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(
+        model, optax.adamw(schedule, weight_decay=args.weight_decay),
+        wrt=nnx.Param)
 
     # 5. Output directory for this run.
     outdir = Path(args.outdir) / f"{args.model}_{int(time.time())}"
@@ -141,13 +167,16 @@ def train(args) -> Path:
             loss = train_step(model, optimizer, xb, yb)
             train_losses.append(float(loss))
 
-        # Validation (batched to bound device memory).
+        # Validation (batched to bound device memory). Switch to eval mode so
+        # dropout is disabled, then back to train mode for the next epoch.
+        model.eval()
         val_losses = []
         for batch in data_mod.iter_batches(
                 ds.val_idx, args.batch_size, shuffle=False):
             xb = jnp.asarray(Xn[batch])
             yb = jnp.asarray(Yn[batch])
             val_losses.append(float(eval_step(model, xb, yb)))
+        model.train()
 
         tr = float(np.mean(train_losses))
         va = float(np.mean(val_losses)) if val_losses else float("nan")
@@ -196,12 +225,17 @@ def save_checkpoint(path: Path, model, ds, args) -> None:
     standardisation statistics needed to reproduce preprocessing and to
     de-normalise predictions. Reload with :func:`load_checkpoint`.
     """
-    _, state = nnx.split(model)
-    params = jax.tree.map(lambda x: np.asarray(x), nnx.to_pure_dict(state))
+    # Persist only the learnable Param state. Non-Param state (dropout RNG
+    # streams -- typed PRNG keys that np.asarray can't convert -- and the
+    # DeepONet fixed pixel coords) is reconstructed deterministically at
+    # build time, so it need not be pickled.
+    _, param_state, _ = nnx.split(model, nnx.Param, ...)
+    params = jax.tree.map(lambda x: np.asarray(x), nnx.to_pure_dict(param_state))
     payload = {
         "model": args.model,
         "model_kwargs": {"latent": args.latent} if args.model == "deeponet" else {},
         "hidden": args.hidden,
+        "dropout": args.dropout,
         "n_features": ds.n_features,
         "n_pixels": ds.n_pixels,
         "feature_names": ds.feature_names,
@@ -243,11 +277,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=1024, dest="batch_size")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4,
+                   dest="weight_decay", help="AdamW weight decay")
     p.add_argument("--hidden", type=int, nargs="*", default=None,
                    help="hidden layer widths (payne: whole net; "
                         "deeponet: branch net)")
     p.add_argument("--latent", type=int, default=256,
                    help="DeepONet latent/basis dimension")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="dropout rate on hidden activations (payne: whole "
+                        "net; deeponet: branch net). 0.0 disables it")
     p.add_argument("--val-frac", type=float, default=0.1, dest="val_frac",
                    help="fraction held out for validation (loss monitoring)")
     p.add_argument("--test-frac", type=float, default=0.1, dest="test_frac",

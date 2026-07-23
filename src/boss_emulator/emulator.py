@@ -56,6 +56,10 @@ class PayneMLP(nnx.Module):
         Hidden layer widths.
     activation : callable
         Nonlinearity applied between hidden layers (default GELU).
+    dropout : float
+        Dropout rate applied to each hidden activation (0.0 disables it,
+        and then no Dropout module is created at all). Active only in
+        training mode; call ``model.eval()`` for deterministic inference.
     """
 
     def __init__(
@@ -64,17 +68,21 @@ class PayneMLP(nnx.Module):
         n_pixels: int,
         hidden: Sequence[int] = (512, 512, 512),
         activation: Activation = nnx.gelu,
+        dropout: float = 0.0,
         *,
         rngs: nnx.Rngs,
     ):
         self.layers = nnx.data(_mlp_layers(rngs, n_features, hidden, n_pixels))
         self.activation = activation
+        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
         self.n_features = n_features
         self.n_pixels = n_pixels
 
     def __call__(self, x: jax.Array) -> jax.Array:
         for layer in self.layers[:-1]:
             x = self.activation(layer(x))
+            if self.dropout is not None:
+                x = self.dropout(x)
         return self.layers[-1](x)  # linear output head
 
 
@@ -97,6 +105,12 @@ class DeepONet(nnx.Module):
         Hidden widths of the two sub-networks.
     activation : callable
         Nonlinearity (default GELU).
+    dropout : float
+        Dropout rate applied to each *branch* hidden activation (the
+        label-dependent encoder). The trunk sees only fixed pixel
+        coordinates and is left clean. 0.0 disables it (no Dropout module
+        created). Active only in training mode; ``model.eval()`` for
+        deterministic inference.
     """
 
     def __init__(
@@ -107,6 +121,7 @@ class DeepONet(nnx.Module):
         branch_hidden: Sequence[int] = (512, 512),
         trunk_hidden: Sequence[int] = (256, 256, 256),
         activation: Activation = nnx.gelu,
+        dropout: float = 0.0,
         *,
         rngs: nnx.Rngs,
     ):
@@ -114,6 +129,7 @@ class DeepONet(nnx.Module):
         self.trunk = nnx.data(_mlp_layers(rngs, 1, trunk_hidden, latent))
         self.bias = nnx.Param(jnp.zeros((n_pixels,)))
         self.activation = activation
+        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
         self.latent = latent
         self.n_features = n_features
         self.n_pixels = n_pixels
@@ -125,6 +141,8 @@ class DeepONet(nnx.Module):
     def _branch(self, x: jax.Array) -> jax.Array:
         for layer in self.branch[:-1]:
             x = self.activation(layer(x))
+            if self.dropout is not None:
+                x = self.dropout(x)
         return self.branch[-1](x)  # (batch, latent)
 
     def _trunk(self, c: jax.Array) -> jax.Array:
@@ -176,6 +194,9 @@ def load_checkpoint(path):
 
     hidden = payload.get("hidden")
     kwargs = dict(payload.get("model_kwargs") or {})
+    dropout = payload.get("dropout", 0.0)
+    if dropout:
+        kwargs["dropout"] = dropout
     if hidden:
         if payload["model"] == "payne":
             kwargs["hidden"] = tuple(hidden)
@@ -184,7 +205,10 @@ def load_checkpoint(path):
     model = build_model(
         payload["model"], payload["n_features"], payload["n_pixels"],
         seed=payload.get("seed", 0), **kwargs)
-    graphdef, state = nnx.split(model)
-    nnx.replace_by_pure_dict(state, payload["params"])
-    model = nnx.merge(graphdef, state)
+    # Restore only the learnable Param state (what save_checkpoint persists);
+    # non-Param state (rng streams, coords) is already correct from build.
+    graphdef, param_state, rest = nnx.split(model, nnx.Param, ...)
+    nnx.replace_by_pure_dict(param_state, payload["params"])
+    model = nnx.merge(graphdef, param_state, rest)
+    model.eval()  # deterministic inference (no-op when there is no dropout)
     return model, payload

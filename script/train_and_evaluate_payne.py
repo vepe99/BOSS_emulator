@@ -146,11 +146,15 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Train a Payne emulator and evaluate reconstruction.")
     # Training hyper-parameters (forwarded to boss_emulator.training).
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=2048, dest="batch_size")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4,
+                   dest="weight_decay", help="AdamW weight decay")
     p.add_argument("--hidden", type=int, nargs="*", default=[1024, 1024, 1024],
                    help="Payne hidden layer widths")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="dropout rate on hidden activations (0.0 disables it)")
     p.add_argument("--labels", nargs="+", default=list(data_mod.CORE_LABELS))
     # Default to the curated abundance elements (CURATED_ELEMENTS minus the
     # fixed H/He, i.e. data.ABUNDANCE_ELEMENTS). Pass --abundances explicitly
@@ -174,6 +178,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # 0. Claim the autocvd-selected GPU up front, before the CPU-heavy data
+    #    load, so JAX holds the free device from the very start.
+    training.claim_gpu()
+
     # 1. Train (build a fully-populated training args namespace with defaults,
     #    then override with our choices) -> returns the run directory.
     train_args = training.build_parser().parse_args([])
@@ -181,7 +189,9 @@ def main():
     train_args.epochs = args.epochs
     train_args.batch_size = args.batch_size
     train_args.lr = args.lr
+    train_args.weight_decay = args.weight_decay
     train_args.hidden = args.hidden
+    train_args.dropout = args.dropout
     train_args.labels = args.labels
     train_args.abundances = args.abundances
     train_args.val_frac = args.val_frac
