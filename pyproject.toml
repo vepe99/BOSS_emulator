@@ -13,6 +13,8 @@ dependencies = [
     "marimo",
     "scipy",
     "h5py>=3.16.0",
+    "flax>=0.12.8",
+    "optax>=0.2.8",
 ]
 
 [build-system]

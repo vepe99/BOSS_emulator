@@ -13,8 +13,13 @@ The HDF5 file stores, per grid point (N = 2,316,600):
   Bookkeeping:
     converged_flag  int64   1 = Korg synthesis converged, 0 = failed
 
-  Large derived array (NOT loaded by default):
+  Large derived array:
     abundances  float64  shape (N, 92)  ~1.7 GB on disk
+      One column per element, ordered by atomic number Z = 1..92
+      (H through U). Each value is A(X), the log abundance on the
+      standard scale where A(H) = 12. It is streamed in row-chunks (never
+      held whole) to build per-element histograms — see
+      `load_abundance_hist` and the `plot_abundance_*` functions.
 
 Total file size ~1.79 GB, almost entirely the `abundances` array.
 The six prior parameters together are only ~55 MB in memory, so they
@@ -56,6 +61,32 @@ PARAM_LABELS = {
     "vmic": r"$v_{\rm mic}$ [km/s]",
 }
 
+# The `abundances` array is (N, 92): one column per element, ordered by
+# atomic number Z = 1..92 (H through U). Each value is A(X), the log
+# abundance on the standard scale where A(H) = 12. Columns 0 (H) and 1
+# (He) are held fixed; the rest vary across the grid with [M/H], alpha
+# and carbon.
+ELEMENT_SYMBOLS = [
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+    "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+    "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd",
+    "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
+    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U",
+]
+
+# A handful of astrophysically interesting elements to show as detailed
+# 1D marginals (in addition to the all-element overview).
+KEY_ELEMENTS = ["C", "N", "O", "Mg", "Si", "Ca", "Ti", "Fe", "Ni", "Ba"]
+
+# Common value grid for the per-element abundance histograms. The grid
+# spans the observed A(X) range with a little headroom on each side.
+ABUND_VALUE_RANGE = (-8.0, 12.5)
+
 
 def load_prior_params(path=DATA_PATH, converged_only=True):
     """Load the scalar prior parameters into a dict of 1D numpy arrays.
@@ -84,6 +115,81 @@ def load_prior_params(path=DATA_PATH, converged_only=True):
         converged_flag = converged_flag[mask]
 
     return params, converged_flag
+
+
+def load_abundance_hist(path=DATA_PATH, converged_only=True,
+                        value_bins=205, chunk=200_000):
+    """Stream the (N, 92) abundances and accumulate, per element, a 1D
+    histogram over a common value grid.
+
+    The full array is ~1.7 GB, so rather than hold it in memory we read
+    it in row-chunks and bin each chunk into a shared (92, value_bins)
+    count array. Running min/max/sum/count per element are tracked too.
+
+    Parameters
+    ----------
+    path : Path or str
+        Location of the HDF5 grid file.
+    converged_only : bool
+        If True, only accumulate grid points with converged_flag == 1.
+    value_bins : int
+        Number of bins spanning ABUND_VALUE_RANGE.
+    chunk : int
+        Number of rows read per iteration.
+
+    Returns
+    -------
+    edges : np.ndarray
+        Shared bin edges, shape (value_bins + 1,).
+    hist : np.ndarray
+        Per-element counts, shape (92, value_bins).
+    stats : dict[str, np.ndarray]
+        "min", "max", "mean" per element, each shape (92,).
+    n_points : int
+        Number of grid points accumulated.
+    """
+    edges = np.linspace(*ABUND_VALUE_RANGE, value_bins + 1)
+
+    with h5py.File(path, "r") as f:
+        dset = f["abundances"]
+        n_total, n_elem = dset.shape
+        flag = f["converged_flag"][:] if converged_only else None
+
+        hist = np.zeros((n_elem, value_bins), dtype=np.int64)
+        emin = np.full(n_elem, np.inf)
+        emax = np.full(n_elem, -np.inf)
+        esum = np.zeros(n_elem)
+        n_points = 0
+
+        for start in range(0, n_total, chunk):
+            stop = min(start + chunk, n_total)
+            block = dset[start:stop]  # (rows, 92)
+            if flag is not None:
+                block = block[flag[start:stop] == 1]
+            if block.size == 0:
+                continue
+
+            n_points += block.shape[0]
+            emin = np.minimum(emin, block.min(axis=0))
+            emax = np.maximum(emax, block.max(axis=0))
+            esum += block.sum(axis=0)
+            # Bin every element's column onto the shared value grid.
+            for e in range(n_elem):
+                hist[e] += np.histogram(block[:, e], bins=edges)[0]
+
+    stats = {"min": emin, "max": emax, "mean": esum / max(n_points, 1)}
+    return edges, hist, stats, n_points
+
+
+def _hist_percentiles(counts, centers, qs=(0.16, 0.5, 0.84)):
+    """Approximate percentiles of a distribution from its binned counts,
+    interpolating the cumulative fraction at the bin centres.
+    """
+    total = counts.sum()
+    if total == 0:
+        return [np.nan] * len(qs)
+    cumfrac = np.cumsum(counts) / total
+    return [float(np.interp(q, cumfrac, centers)) for q in qs]
 
 
 def report_volume(path=DATA_PATH):
@@ -266,6 +372,100 @@ def plot_failure_rate(params_all, mask, bins=80, outdir=PLOTS_DIR):
     print(f"  wrote {out}")
 
 
+def plot_abundance_hist2d(edges, hist, n_points, outdir=PLOTS_DIR):
+    """All 92 elements at once: a 2D density of A(X) vs atomic number.
+
+    Each vertical strip is one element's marginal abundance distribution
+    over the grid, on a shared value axis and a log colour scale. Reveals
+    at a glance which elements are fixed (H, He), which span a wide range,
+    and where the bulk of each element's abundances sits.
+    """
+    n_elem = hist.shape[0]
+    xedges = np.arange(0.5, n_elem + 1.5)  # one column per element
+    fig, ax = plt.subplots(figsize=(20, 7))
+    pcm = ax.pcolormesh(
+        xedges, edges, hist.T, cmap="viridis",
+        norm=matplotlib.colors.LogNorm(),
+    )
+    fig.colorbar(pcm, ax=ax, label="count")
+    ax.set_xticks(np.arange(1, n_elem + 1))
+    ax.set_xticklabels(ELEMENT_SYMBOLS, rotation=90, fontsize=6)
+    ax.set_xlim(0.5, n_elem + 0.5)
+    ax.set_xlabel("element (by atomic number Z)")
+    ax.set_ylabel(r"$A(X) = \log_{10}(N_X/N_{\rm H}) + 12$")
+    ax.set_title(f"Abundance distribution across all elements (N={n_points:,})")
+    fig.tight_layout()
+    out = outdir / "abundances_hist2d.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
+def plot_abundance_summary(edges, hist, stats, outdir=PLOTS_DIR):
+    """Per-element spread as a percentile band vs atomic number.
+
+    For every element we draw the min-max range (whiskers), the 16-84th
+    percentile band, and the median, derived from the accumulated
+    histogram. Compact way to see the width of each element's grid
+    distribution and how it varies along the periodic table.
+    """
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    n_elem = hist.shape[0]
+    Z = np.arange(1, n_elem + 1)
+
+    p16 = np.empty(n_elem)
+    p50 = np.empty(n_elem)
+    p84 = np.empty(n_elem)
+    for e in range(n_elem):
+        p16[e], p50[e], p84[e] = _hist_percentiles(hist[e], centers)
+
+    fig, ax = plt.subplots(figsize=(20, 7))
+    ax.vlines(Z, stats["min"], stats["max"], color="#B0B0B0",
+              lw=1, label="min-max")
+    ax.fill_between(Z, p16, p84, color="#4C72B0", alpha=0.4,
+                    step="mid", label="16-84th pct")
+    ax.plot(Z, p50, ".", color="#C44E52", ms=5, label="median")
+    ax.set_xticks(Z)
+    ax.set_xticklabels(ELEMENT_SYMBOLS, rotation=90, fontsize=6)
+    ax.set_xlim(0.5, n_elem + 0.5)
+    ax.set_xlabel("element (by atomic number Z)")
+    ax.set_ylabel(r"$A(X)$")
+    ax.set_title("Per-element abundance spread across the grid")
+    ax.legend()
+    fig.tight_layout()
+    out = outdir / "abundances_summary.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
+def plot_abundance_marginals(edges, hist, outdir=PLOTS_DIR):
+    """1D marginal histograms for a selection of key elements, drawn
+    directly from the accumulated per-element counts.
+    """
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    width = edges[1] - edges[0]
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    for ax, sym in zip(axes.ravel(), KEY_ELEMENTS):
+        e = ELEMENT_SYMBOLS.index(sym)
+        ax.bar(centers, hist[e], width=width, color="#4C72B0", align="center")
+        ax.set_xlabel(f"A({sym})")
+        ax.set_ylabel("count")
+        ax.set_yscale("log")
+        # Zoom onto the populated part of the value axis.
+        nz = np.nonzero(hist[e])[0]
+        if nz.size:
+            lo = centers[nz[0]] - 2 * width
+            hi = centers[nz[-1]] + 2 * width
+            ax.set_xlim(lo, hi)
+    fig.suptitle("Abundance marginals for selected elements")
+    fig.tight_layout()
+    out = outdir / "abundances_marginals.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
 def make_plots():
     """Load the grid and write all exploration plots to PLOTS_DIR."""
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,6 +480,12 @@ def make_plots():
     plot_marginals(params_all, mask)
     plot_kiel(params_conv)
     plot_failure_rate(params_all, mask)
+
+    print("  streaming abundances (converged points) ...")
+    edges, hist, stats, n_points = load_abundance_hist(converged_only=True)
+    plot_abundance_hist2d(edges, hist, n_points)
+    plot_abundance_summary(edges, hist, stats)
+    plot_abundance_marginals(edges, hist)
 
 
 def make_plots_converged():
@@ -299,6 +505,12 @@ def make_plots_converged():
     plot_marginals_single(params_conv, outdir=PLOTS_DIR_CONVERGED)
     plot_kiel(params_conv, outdir=PLOTS_DIR_CONVERGED)
 
+    print("  streaming abundances (converged points) ...")
+    edges, hist, stats, n_points = load_abundance_hist(converged_only=True)
+    plot_abundance_hist2d(edges, hist, n_points, outdir=PLOTS_DIR_CONVERGED)
+    plot_abundance_summary(edges, hist, stats, outdir=PLOTS_DIR_CONVERGED)
+    plot_abundance_marginals(edges, hist, outdir=PLOTS_DIR_CONVERGED)
+
 
 def main():
     report_volume()
@@ -314,6 +526,18 @@ def main():
     print("\nPer-parameter ranges:")
     for name, arr in params.items():
         print(f"  {name:10s} min={arr.min():10.4g}  max={arr.max():10.4g}")
+
+    print("\nStreaming abundances for per-element summary ...")
+    edges, hist, stats, n_points = load_abundance_hist(converged_only=True)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    print(f"Accumulated {n_points:,} converged points over "
+          f"{hist.shape[0]} elements.")
+    print(f"{'elem':>5s} {'min':>8s} {'p16':>8s} {'median':>8s} "
+          f"{'p84':>8s} {'max':>8s}")
+    for e, sym in enumerate(ELEMENT_SYMBOLS):
+        p16, p50, p84 = _hist_percentiles(hist[e], centers)
+        print(f"{sym:>5s} {stats['min'][e]:8.3f} {p16:8.3f} {p50:8.3f} "
+              f"{p84:8.3f} {stats['max'][e]:8.3f}")
 
     make_plots()
     make_plots_converged()

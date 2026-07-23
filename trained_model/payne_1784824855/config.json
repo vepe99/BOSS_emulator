@@ -1,0 +1,51 @@
+{
+  "model": "payne",
+  "labels": [
+    "Teff",
+    "logg",
+    "m_H",
+    "alpha_m",
+    "carbon_m",
+    "vmic"
+  ],
+  "abundances": [
+    "Li",
+    "C",
+    "N",
+    "O",
+    "Na",
+    "Mg",
+    "Al",
+    "Si",
+    "S",
+    "K",
+    "Ca",
+    "Sc",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn"
+  ],
+  "target": "norm_flux",
+  "epochs": 500,
+  "batch_size": 1024,
+  "lr": 0.001,
+  "hidden": [
+    256,
+    256
+  ],
+  "latent": 256,
+  "val_frac": 0.1,
+  "test_frac": 0.1,
+  "seed": 0,
+  "max_rows": null,
+  "no_standardize_y": false,
+  "rebuild_cache": false,
+  "outdir": "/export/data/vgiusepp/BOSS_emulator/trained_model",
+  "list_abundances": false
+}
