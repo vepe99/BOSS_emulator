@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib",
     "marimo",
     "scipy",
+    "h5py>=3.16.0",
 ]
 
 [build-system]
