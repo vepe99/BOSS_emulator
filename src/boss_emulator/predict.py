@@ -148,6 +148,12 @@ def reconstruction_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
     per_spec_rmse = np.sqrt((resid ** 2).mean(axis=1))
     per_pixel_rmse = np.sqrt((resid ** 2).mean(axis=0))
 
+    # Per-pixel (per-wavelength) median absolute error: the median over
+    # spectra of the absolute error at each pixel. Reduced across pixels
+    # this gives a single, outlier-robust "typical approximation error at a
+    # wavelength" figure.
+    per_pixel_median_abs_error = np.median(abs_resid, axis=0)
+
     # Coefficient of determination pooled over all pixels/spectra.
     ss_res = float((resid ** 2).sum())
     ss_tot = float(((true - true.mean()) ** 2).sum())
@@ -160,6 +166,14 @@ def reconstruction_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
         "mae": float(abs_resid.mean()),
         "max_abs_error": float(abs_resid.max()),
         "median_abs_error": float(np.median(abs_resid)),
+        # Median (across pixel/wavelengths) of the per-pixel median absolute
+        # error -- the typical approximation error at a wavelength.
+        "per_pixel_median_abs_error_median": float(
+            np.median(per_pixel_median_abs_error)),
+        "per_pixel_median_abs_error_p90": float(
+            np.percentile(per_pixel_median_abs_error, 90)),
+        "per_pixel_median_abs_error_max": float(
+            per_pixel_median_abs_error.max()),
         "r2": r2,
         "per_spectrum_rmse_mean": float(per_spec_rmse.mean()),
         "per_spectrum_rmse_median": float(np.median(per_spec_rmse)),
@@ -167,6 +181,7 @@ def reconstruction_metrics(pred: np.ndarray, true: np.ndarray) -> dict:
         "per_spectrum_rmse_max": float(per_spec_rmse.max()),
         # arrays kept out of the JSON summary; returned for plotting
         "_per_pixel_rmse": per_pixel_rmse,
+        "_per_pixel_median_abs_error": per_pixel_median_abs_error,
         "_per_spectrum_rmse": per_spec_rmse,
     }
 
@@ -187,6 +202,22 @@ def plot_test_metrics(pred, true, metrics, outdir: Path, n_show: int = 6):
     ax.set_title("Per-pixel reconstruction RMSE (test set)")
     fig.tight_layout()
     fig.savefig(outdir / "test_per_pixel_rmse.png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+    # Per-pixel median absolute (approximation) error curve, with the median
+    # across pixels drawn as a reference line.
+    ppmae = metrics["_per_pixel_median_abs_error"]
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(pix, ppmae, lw=0.7, color="#55A868")
+    ax.axhline(np.median(ppmae), color="#333333", ls="--", lw=1.0,
+               label=f"median across pixels = {np.median(ppmae):.3e}")
+    ax.set_xlabel("pixel index")
+    ax.set_ylabel("median |error|")
+    ax.set_title("Per-pixel median approximation error (test set)")
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(outdir / "test_per_pixel_median_abs_error.png",
+                dpi=130, bbox_inches="tight")
     plt.close(fig)
 
     # Per-spectrum RMSE histogram.

@@ -1,0 +1,28 @@
+{
+  "whole_dataset": {
+    "n_spectra": 2254492,
+    "n_pixels": 4479,
+    "rmse": 0.04202301906116847,
+    "mae": 0.027211463460532357,
+    "max_abs_error": 0.8907998204231262,
+    "r2": 0.9749771352221229,
+    "per_spectrum_rmse_mean": 0.03965431824326515,
+    "per_spectrum_rmse_median": 0.03651857376098633,
+    "per_spectrum_rmse_p90": 0.057925429195165634,
+    "per_spectrum_rmse_p99": 0.08008580654859543,
+    "per_spectrum_rmse_max": 0.3311273753643036
+  },
+  "test_set": {
+    "n_spectra": 225449,
+    "n_pixels": 4479,
+    "rmse": 0.04195732995867729,
+    "mae": 0.02717573381960392,
+    "max_abs_error": 0.8206329941749573,
+    "median_abs_error": 0.015846848487854004,
+    "r2": 0.9750151485099309,
+    "per_spectrum_rmse_mean": 0.03961092233657837,
+    "per_spectrum_rmse_median": 0.03648126870393753,
+    "per_spectrum_rmse_p90": 0.05787336453795433,
+    "per_spectrum_rmse_max": 0.2509840428829193
+  }
+}

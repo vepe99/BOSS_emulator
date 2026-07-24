@@ -1,0 +1,109 @@
+{
+  "spearman": {
+    "Teff": -0.5906892249044446,
+    "logg": -0.17599296837997372,
+    "m_H": 0.23546209030914014,
+    "alpha_m": -0.05059496294181104,
+    "carbon_m": 0.2017105483827202,
+    "vmic": 0.2459471470214125,
+    "A(Li)": 0.23546209030914014,
+    "A(C)": 0.308000200969129,
+    "A(N)": 0.23546209030914014,
+    "A(O)": 0.17690573083918212,
+    "A(Na)": 0.23546209030914014,
+    "A(Mg)": 0.17690573083918212,
+    "A(Al)": 0.23546209030914014,
+    "A(Si)": 0.17690573083918212,
+    "A(S)": 0.17690573083918212,
+    "A(K)": 0.23546209030914014,
+    "A(Ca)": 0.17690573083918212,
+    "A(Sc)": 0.23546209030914014,
+    "A(Ti)": 0.17690573083918212,
+    "A(V)": 0.23546209030914014,
+    "A(Cr)": 0.23546209030914014,
+    "A(Mn)": 0.23546209030914014,
+    "A(Fe)": 0.23546209030914014,
+    "A(Co)": 0.23546209030914014,
+    "A(Ni)": 0.23546209030914014,
+    "A(Cu)": 0.23546209030914014,
+    "A(Zn)": 0.23546209030914014
+  },
+  "worst_vs_all": {
+    "worst100": {
+      "Teff": {
+        "worst_median": 3500.0,
+        "all_median": 4500.0,
+        "worst_min": 2800.0,
+        "worst_max": 4250.0
+      },
+      "logg": {
+        "worst_median": 0.5,
+        "all_median": 2.5,
+        "worst_min": -0.5,
+        "worst_max": 4.0
+      },
+      "m_H": {
+        "worst_median": 0.375,
+        "all_median": -0.75,
+        "worst_min": -2.25,
+        "worst_max": 1.0
+      },
+      "alpha_m": {
+        "worst_median": 0.0,
+        "all_median": 0.0,
+        "worst_min": -1.0,
+        "worst_max": 1.0
+      },
+      "carbon_m": {
+        "worst_median": 0.75,
+        "all_median": -0.25,
+        "worst_min": -0.75,
+        "worst_max": 1.0
+      },
+      "vmic": {
+        "worst_median": 5.0,
+        "all_median": 1.9921101331710815,
+        "worst_min": 0.3162277638912201,
+        "worst_max": 5.0
+      }
+    },
+    "worst1000": {
+      "Teff": {
+        "worst_median": 3300.0,
+        "all_median": 4500.0,
+        "worst_min": 2800.0,
+        "worst_max": 7750.0
+      },
+      "logg": {
+        "worst_median": 0.5,
+        "all_median": 2.5,
+        "worst_min": -0.5,
+        "worst_max": 5.5
+      },
+      "m_H": {
+        "worst_median": -0.5,
+        "all_median": -0.75,
+        "worst_min": -2.25,
+        "worst_max": 1.0
+      },
+      "alpha_m": {
+        "worst_median": -0.25,
+        "all_median": 0.0,
+        "worst_min": -1.0,
+        "worst_max": 1.0
+      },
+      "carbon_m": {
+        "worst_median": 0.5,
+        "all_median": -0.25,
+        "worst_min": -1.5,
+        "worst_max": 1.0
+      },
+      "vmic": {
+        "worst_median": 5.0,
+        "all_median": 1.9921101331710815,
+        "worst_min": 0.3162277638912201,
+        "worst_max": 5.0
+      }
+    }
+  }
+}

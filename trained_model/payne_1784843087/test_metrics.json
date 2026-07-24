@@ -1,0 +1,16 @@
+{
+  "n_spectra": 225449,
+  "n_pixels": 4479,
+  "rmse": 0.002895420417189598,
+  "mae": 0.0013287547044456005,
+  "max_abs_error": 0.5351268649101257,
+  "median_abs_error": 0.0005826354026794434,
+  "per_pixel_median_abs_error_median": 0.0005539059638977051,
+  "per_pixel_median_abs_error_p90": 0.001458114362321794,
+  "per_pixel_median_abs_error_max": 0.0030502676963806152,
+  "r2": 0.999881017154556,
+  "per_spectrum_rmse_mean": 0.0019876703154295683,
+  "per_spectrum_rmse_median": 0.0015018335543572903,
+  "per_spectrum_rmse_p90": 0.0034118627663701773,
+  "per_spectrum_rmse_max": 0.24952873587608337
+}
