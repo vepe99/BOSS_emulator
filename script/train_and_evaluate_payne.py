@@ -200,22 +200,14 @@ def main():
     train_args.max_rows = args.max_rows
     train_args.outdir = args.outdir
 
-    run_dir = training.train(train_args)
+    run_dir, ds = training.train(train_args)
 
-    # 2. Reload the best checkpoint and rebuild the exact same dataset/split.
+    # 2. Reload the best checkpoint for the best-val weights. The dataset (and
+    #    its train/val/test split) is reused from training rather than
+    #    re-loaded -- the split is seed-deterministic, so it is identical to
+    #    what the checkpoint's data_config would reproduce, and this avoids a
+    #    second ~38 GB read of the cache.
     model, payload = load_checkpoint(run_dir / "best.pkl")
-    cfg = payload["data_config"]
-    print(f"\n[eval] rebuilding dataset for evaluation: {cfg}")
-    ds = data_mod.load_dataset(
-        core_labels=cfg["core_labels"],
-        abundance_elements=cfg["abundance_elements"],
-        target=cfg["target"],
-        val_frac=cfg["val_frac"],
-        test_frac=cfg["test_frac"],
-        seed=cfg["seed"],
-        max_rows=cfg["max_rows"],
-        standardize_y=cfg["standardize_y"],
-    )
 
     # 3. Reconstruction of 5 random test-set spectra.
     rng = np.random.default_rng(args.seed)

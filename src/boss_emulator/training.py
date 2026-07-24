@@ -92,7 +92,7 @@ def eval_step(model, x, y):
 # Training loop
 # =========================================================================
 
-def train(args) -> Path:
+def train(args) -> tuple[Path, "data_mod.Dataset"]:
     # 1. Ensure the preprocessed cache exists (built once).
     data_mod.build_cache(rebuild=args.rebuild_cache)
 
@@ -127,6 +127,11 @@ def train(args) -> Path:
             model_kwargs["branch_hidden"] = tuple(args.hidden)
     if args.model == "deeponet":
         model_kwargs["latent"] = args.latent
+    if args.model == "transformer":
+        model_kwargs["d_model"] = args.d_model
+        model_kwargs["n_heads"] = args.n_heads
+        model_kwargs["n_blocks"] = args.n_blocks
+        model_kwargs["mlp_dim"] = args.mlp_dim
     if args.dropout:
         model_kwargs["dropout"] = args.dropout
     model = build_model(
@@ -195,7 +200,9 @@ def train(args) -> Path:
     (outdir / "config.json").write_text(json.dumps(vars(args), indent=2, default=str))
     plot_loss(history, outdir / "loss_curve.png")
     print(f"[train] done. best val_mse={best_val:.4e}  -> {outdir}")
-    return outdir
+    # Return the assembled dataset too, so callers that go on to evaluate can
+    # reuse it instead of re-loading the ~38 GB cache a second time.
+    return outdir, ds
 
 
 def plot_loss(history: list[dict], path: Path) -> None:
@@ -218,6 +225,24 @@ def plot_loss(history: list[dict], path: Path) -> None:
     plt.close(fig)
 
 
+def _persisted_model_kwargs(args) -> dict:
+    """Model-specific constructor kwargs to store in the checkpoint.
+
+    Excludes ``dropout`` and ``hidden``, which ``load_checkpoint`` restores
+    from their own dedicated payload fields.
+    """
+    if args.model == "deeponet":
+        return {"latent": args.latent}
+    if args.model == "transformer":
+        return {
+            "d_model": args.d_model,
+            "n_heads": args.n_heads,
+            "n_blocks": args.n_blocks,
+            "mlp_dim": args.mlp_dim,
+        }
+    return {}
+
+
 def save_checkpoint(path: Path, model, ds, args) -> None:
     """Persist model parameters + normalisation stats + minimal config.
 
@@ -233,7 +258,7 @@ def save_checkpoint(path: Path, model, ds, args) -> None:
     params = jax.tree.map(lambda x: np.asarray(x), nnx.to_pure_dict(param_state))
     payload = {
         "model": args.model,
-        "model_kwargs": {"latent": args.latent} if args.model == "deeponet" else {},
+        "model_kwargs": _persisted_model_kwargs(args),
         "hidden": args.hidden,
         "dropout": args.dropout,
         "n_features": ds.n_features,
@@ -266,7 +291,8 @@ def save_checkpoint(path: Path, model, ds, args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train a BOSS spectral emulator.")
-    p.add_argument("--model", choices=["payne", "deeponet"], default="payne")
+    p.add_argument("--model", choices=["payne", "deeponet", "transformer"],
+                   default="payne")
     p.add_argument("--labels", nargs="+", default=list(CORE_LABELS),
                    metavar="LABEL",
                    help=f"core labels to use (subset of {CORE_LABELS})")
@@ -284,6 +310,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "deeponet: branch net)")
     p.add_argument("--latent", type=int, default=256,
                    help="DeepONet latent/basis dimension")
+    p.add_argument("--d-model", type=int, default=256, dest="d_model",
+                   help="transformer token/embedding width")
+    p.add_argument("--n-heads", type=int, default=8, dest="n_heads",
+                   help="transformer number of attention heads")
+    p.add_argument("--n-blocks", type=int, default=4, dest="n_blocks",
+                   help="transformer number of cross-attention blocks")
+    p.add_argument("--mlp-dim", type=int, default=512, dest="mlp_dim",
+                   help="transformer feed-forward hidden width")
     p.add_argument("--dropout", type=float, default=0.0,
                    help="dropout rate on hidden activations (payne: whole "
                         "net; deeponet: branch net). 0.0 disables it")

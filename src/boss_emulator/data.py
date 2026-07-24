@@ -227,6 +227,45 @@ class Dataset:
         return y * self.y_std + self.y_mean
 
 
+def _ystats_cache_path(
+    cache_path: Path, target: str, seed: int, val_frac: float,
+    test_frac: float, max_rows: int | None, n_total: int,
+) -> Path:
+    """Sidecar path for cached target standardisation stats.
+
+    The target (``norm_flux``) mean/std are computed on the training split
+    only, and that split is fully determined by ``(seed, val_frac, test_frac,
+    max_rows, n_total)`` -- independent of which input labels are selected. So
+    we cache ``y_mean``/``y_std`` keyed by exactly those fields; any change
+    (including a rebuilt cache with a different row count) yields a new key.
+    """
+    key = (f"{target}_seed{seed}_val{val_frac:g}_test{test_frac:g}"
+           f"_rows{max_rows}_n{n_total}")
+    return cache_path.with_name(f"{cache_path.stem}.ystats.{key}.npz")
+
+
+def _compute_y_stats(Y: np.ndarray, train_idx: np.ndarray, n_pixels: int):
+    """Per-pixel mean/std over the training rows, in a memory-bounded pass.
+
+    Streaming in row blocks avoids materialising the full ``Y[train_idx]``
+    copy (~32 GB at the full grid), which alone costs ~50 s. Accumulates in
+    float64 for a numerically stable sum-of-squares variance.
+    """
+    count = int(train_idx.size)
+    s = np.zeros(n_pixels, dtype=np.float64)
+    ss = np.zeros(n_pixels, dtype=np.float64)
+    block = 200_000
+    for i in range(0, count, block):
+        blk = Y[train_idx[i:i + block]].astype(np.float64)
+        s += blk.sum(axis=0)
+        ss += (blk * blk).sum(axis=0)
+    y_mean = s / count
+    y_var = np.maximum(ss / count - y_mean ** 2, 0.0)
+    y_std = np.sqrt(y_var)
+    y_std[y_std == 0] = 1.0
+    return y_mean.astype("float32"), y_std.astype("float32")
+
+
 def _resolve_abundances(elements: list[str]) -> list[int]:
     """Map element symbols (e.g. 'Fe') to their column index in the cached
     ``abundances`` array (which holds only ``ABUNDANCE_ELEMENTS``)."""
@@ -297,27 +336,30 @@ def load_dataset(
         n_total = int(f.attrs["n_converged"])
         n_pixels = int(f.attrs["n_pixels"])
 
-        # Row subset (sorted for efficient h5 fancy indexing).
-        if max_rows is not None and max_rows < n_total:
+        # Row subset. For the common full-dataset case we read with a plain
+        # slice (`[:]`): h5py fancy indexing with an explicit index array is
+        # ~2.5x slower than a contiguous slice for the 38 GB target, so we
+        # only pay that cost when actually subsampling (``max_rows``).
+        subsample = max_rows is not None and max_rows < n_total
+        if subsample:
             rows = np.sort(rng.choice(n_total, size=max_rows, replace=False))
+            sel = rows                       # h5py fancy index
         else:
             rows = np.arange(n_total)
+            sel = slice(None)                # full contiguous read (fast path)
 
         # Inputs: core labels then chosen abundances.
-        x_cols = [f[name][rows] for name in core_labels]
+        x_cols = [f[name][sel] for name in core_labels]
         if abund_cols:
-            ab = f["abundances"][rows, :]
+            ab = f["abundances"][sel, :]
             for c in abund_cols:
                 x_cols.append(ab[:, c])
         X = np.stack(x_cols, axis=1).astype("float32")
 
-        # Target.
-        if in_memory:
-            Y = f[target][rows, :].astype("float32")
-        else:
-            # Materialise the subset to a fresh in-file order is expensive;
-            # for the streaming path we just load anyway (kept for symmetry).
-            Y = f[target][rows, :].astype("float32")
+        # Target (read once into RAM; the machine has ~1 TB). The cache
+        # already stores float32, so ``copy=False`` avoids a needless second
+        # ~38 GB allocation+copy of the full target.
+        Y = f[target][sel, :].astype("float32", copy=False)
 
     feature_names = list(core_labels) + [f"A({s})" for s in abundance_elements]
     n = X.shape[0]
@@ -340,9 +382,25 @@ def load_dataset(
     x_std = X[train_idx].std(axis=0)
     x_std[x_std == 0] = 1.0
     if standardize_y:
-        y_mean = Y[train_idx].mean(axis=0)
-        y_std = Y[train_idx].std(axis=0)
-        y_std[y_std == 0] = 1.0
+        # The target stats are expensive (~85 s at the full grid) but depend
+        # only on the split, not on the run -- so cache them to a sidecar
+        # ``.npz`` next to the preprocessed dataset and reuse across runs.
+        stats_path = _ystats_cache_path(
+            cache_path, target, seed, val_frac, test_frac, max_rows, n_total)
+        if stats_path.exists():
+            with np.load(stats_path) as st:
+                y_mean, y_std = st["y_mean"], st["y_std"]
+            if y_mean.shape == (n_pixels,) and y_std.shape == (n_pixels,):
+                print(f"[data] loaded cached target stats: {stats_path.name}")
+            else:  # stale/mismatched cache -> recompute
+                y_mean, y_std = _compute_y_stats(Y, train_idx, n_pixels)
+        else:
+            y_mean, y_std = _compute_y_stats(Y, train_idx, n_pixels)
+            try:
+                np.savez(stats_path, y_mean=y_mean, y_std=y_std)
+                print(f"[data] cached target stats -> {stats_path.name}")
+            except OSError as e:  # non-fatal: stats still returned in-memory
+                print(f"[data] warning: could not write stats cache ({e})")
     else:
         y_mean = np.zeros(n_pixels, dtype="float32")
         y_std = np.ones(n_pixels, dtype="float32")

@@ -1,6 +1,6 @@
 """Neural spectral emulators built with Flax NNX.
 
-Two architectures map stellar labels to a normalised spectrum of
+Three architectures map stellar labels to a normalised spectrum of
 ``n_pixels`` fluxes:
 
 * :class:`PayneMLP` -- a Payne-style multilayer perceptron that emits the
@@ -14,7 +14,16 @@ Two architectures map stellar labels to a normalised spectrum of
   (branch) from "where on the spectrum" (trunk) and can generalise across
   the pixel grid.
 
-Both take standardised inputs and return standardised outputs; the
+* :class:`SpectraFormer` -- a Perceiver-style cross-attention decoder. Each
+  scalar label becomes a memory token (the keys/values); each pixel owns a
+  learned query embedding. Stacked multi-head cross-attention blocks (with
+  residual connections + pre-LayerNorm) let every pixel query the label
+  memory, and a linear head reads out the flux. Pixels attend only to the
+  labels, never to each other, so the whole spectrum is produced in a single
+  forward pass and the pixels stay mutually independent -- a learned,
+  attention-weighted generalisation of the DeepONet factorisation.
+
+All take standardised inputs and return standardised outputs; the
 de-standardisation lives with the :class:`~boss_emulator.data.Dataset`.
 """
 
@@ -158,6 +167,138 @@ class DeepONet(nnx.Module):
         return out + self.bias.value
 
 
+class _CrossAttnBlock(nnx.Module):
+    """One pre-LayerNorm cross-attention + feed-forward block.
+
+    Queries (one per pixel) attend to a fixed label memory (K/V). Both the
+    attention and the FFN are wrapped in residual connections; LayerNorm is
+    applied to the *inputs* of each sub-layer (pre-LN), which trains more
+    stably than post-LN for deep stacks. The label memory is not updated
+    here -- only the queries are -- so pixels never attend to one another.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        mlp_dim: int,
+        activation: Activation,
+        dropout: float,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.ln_q = nnx.LayerNorm(d_model, rngs=rngs)
+        self.ln_kv = nnx.LayerNorm(d_model, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=n_heads, in_features=d_model,
+            dropout_rate=dropout, decode=False, rngs=rngs)
+        self.ln_ff = nnx.LayerNorm(d_model, rngs=rngs)
+        self.fc1 = nnx.Linear(d_model, mlp_dim, rngs=rngs)
+        self.fc2 = nnx.Linear(mlp_dim, d_model, rngs=rngs)
+        self.activation = activation
+        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
+
+    def _drop(self, x: jax.Array) -> jax.Array:
+        return self.dropout(x) if self.dropout is not None else x
+
+    def __call__(self, q: jax.Array, kv: jax.Array) -> jax.Array:
+        # Cross-attention sub-layer (queries attend to the label memory).
+        qn = self.ln_q(q)
+        kvn = self.ln_kv(kv)
+        q = q + self.attn(qn, kvn, kvn)
+        # Position-wise feed-forward sub-layer.
+        h = self._drop(self.activation(self.fc1(self.ln_ff(q))))
+        q = q + self._drop(self.fc2(h))
+        return q
+
+
+class SpectraFormer(nnx.Module):
+    """Cross-attention decoder: labels -> spectrum, one shot.
+
+    The ``n_features`` scalar labels are projected to ``d_model`` and given a
+    learned per-label embedding, forming a small memory of key/value tokens.
+    Each of the ``n_pixels`` output pixels owns a learned query embedding.
+    ``n_blocks`` multi-head cross-attention blocks let the pixel queries read
+    from the label memory (residual + pre-LayerNorm throughout), and a linear
+    head maps each refined query to its scalar flux.
+
+    Because pixels attend only to the labels (never to each other), the model
+    is permutation-equivariant over pixels and emits the full spectrum in a
+    single pass -- an attention-weighted generalisation of DeepONet.
+
+    Parameters
+    ----------
+    n_features : int
+        Number of input labels (number of memory tokens).
+    n_pixels : int
+        Length of the output spectrum (number of query tokens).
+    d_model : int
+        Token/embedding width shared by queries and memory.
+    n_heads : int
+        Number of attention heads (must divide ``d_model``).
+    n_blocks : int
+        Number of stacked cross-attention blocks.
+    mlp_dim : int
+        Hidden width of each block's feed-forward network.
+    activation : callable
+        Feed-forward nonlinearity (default GELU).
+    dropout : float
+        Dropout rate applied inside attention and the feed-forward networks.
+        0.0 disables it (no Dropout modules created). Active only in training
+        mode; call ``model.eval()`` for deterministic inference.
+
+    Notes
+    -----
+    Activations scale as ``batch * n_pixels * d_model`` (and ``* mlp_dim`` in
+    the FFN), which for the full 4479-pixel grid is the memory bottleneck.
+    Use a smaller ``--batch-size`` (e.g. 256) than the MLP/DeepONet default.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        n_pixels: int,
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_blocks: int = 4,
+        mlp_dim: int = 512,
+        activation: Activation = nnx.gelu,
+        dropout: float = 0.0,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.value_proj = nnx.Linear(1, d_model, rngs=rngs)   # scalar -> token
+        self.label_embed = nnx.Embed(n_features, d_model, rngs=rngs)
+        self.query_embed = nnx.Embed(n_pixels, d_model, rngs=rngs)
+        self.blocks = nnx.data([
+            _CrossAttnBlock(d_model, n_heads, mlp_dim, activation, dropout,
+                            rngs=rngs)
+            for _ in range(n_blocks)
+        ])
+        self.ln_out = nnx.LayerNorm(d_model, rngs=rngs)
+        self.head = nnx.Linear(d_model, 1, rngs=rngs)
+        self.d_model = d_model
+        self.n_features = n_features
+        self.n_pixels = n_pixels
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        b = x.shape[0]
+        # Label memory (keys/values): value token + learned label identity.
+        values = self.value_proj(x[..., None])                # (b, n_feat, d)
+        labels = self.label_embed(jnp.arange(self.n_features))  # (n_feat, d)
+        kv = values + labels[None]                            # (b, n_feat, d)
+        # Pixel queries, shared across the batch then refined per sample.
+        q = self.query_embed(jnp.arange(self.n_pixels))        # (n_pix, d)
+        q = jnp.broadcast_to(q, (b, self.n_pixels, self.d_model))
+        for block in self.blocks:
+            q = block(q, kv)
+        out = self.head(self.ln_out(q))                       # (b, n_pix, 1)
+        return out[..., 0]                                    # (b, n_pix)
+
+
 def build_model(
     name: str,
     n_features: int,
@@ -165,14 +306,17 @@ def build_model(
     seed: int = 0,
     **kwargs,
 ) -> nnx.Module:
-    """Factory: construct a model by name ('payne' or 'deeponet')."""
+    """Factory: construct a model by name ('payne', 'deeponet', 'transformer')."""
     rngs = nnx.Rngs(seed)
     name = name.lower()
     if name == "payne":
         return PayneMLP(n_features, n_pixels, rngs=rngs, **kwargs)
     if name == "deeponet":
         return DeepONet(n_features, n_pixels, rngs=rngs, **kwargs)
-    raise ValueError(f"unknown model {name!r}; choose 'payne' or 'deeponet'")
+    if name == "transformer":
+        return SpectraFormer(n_features, n_pixels, rngs=rngs, **kwargs)
+    raise ValueError(
+        f"unknown model {name!r}; choose 'payne', 'deeponet' or 'transformer'")
 
 
 def load_checkpoint(path):
