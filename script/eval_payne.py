@@ -2,8 +2,14 @@
 
 One entry point for every test-set diagnostic in this project. Point it at one
 or more run directories (each containing ``best.pkl`` and, ideally,
-``split_idx.npz``); the ~38 GB dataset cache is loaded once and reused across
-all of them.
+``split_idx.npz``); the dataset is loaded once and reused across all of them.
+
+Only test rows are ever read, so by default this loads a contiguous test-only
+sidecar (``*.testset.*.npz``, ~4 GB) instead of the full 40 GB cache plus its
+~38 GB standardised copy. The sidecar is built automatically on first use --
+one sequential pass over the main cache -- and reused thereafter. Pass
+``--full-data`` to load everything the old way, which is what runs trained
+with a different split need.
 
 Per run it writes ``reconstruction_stats_full.json`` (into the run dir and the
 plots dir) and, unless ``--metrics-only``, five figures prefixed by the run's
@@ -12,6 +18,8 @@ tag:
   * ``<tag>_error_distribution.png``    -- per-spectrum RMSE histogram (lin+log)
   * ``<tag>_sample_reconstructions.png``-- best / p25 / median / p90 spectra
   * ``<tag>_worst_reconstructions.png`` -- the 4 highest-RMSE spectra
+
+Each reconstruction panel carries a percentage-residual strip underneath it.
   * ``<tag>_teff_carbon_map.png``       -- error over the (Teff, carbon_m) plane
   * ``<tag>_corner_error.png``          -- error over the 6-D core-label space
 
@@ -24,6 +32,10 @@ Examples::
     # just the numbers, for a batch of runs
     UV_CACHE_DIR=... uv run python script/eval_payne.py --metrics-only \
         trained_model/payne_hpo/trial_00{16,25,31}/payne_*
+
+    # different example spectra in the panels (same typicality, new draws)
+    UV_CACHE_DIR=... uv run python script/eval_payne.py --sample-seed 7 \
+        trained_model/payne_hpo/trial_0031/payne_* --tags trial31
 
 autocvd claims a free GPU before JAX initialises (lab policy).
 """
@@ -48,6 +60,7 @@ from boss_emulator.emulator import load_checkpoint
 NBIN = 24            # bins per axis in the label-space corner plot
 NT, NC = 40, 24      # Teff / carbon_m bins in the 2-D error map
 BATCH = 8192
+MIN_FLUX = 1e-2      # below this true flux, % residual is meaningless (masked)
 
 # Candidate cuts reported as a text summary -- the regions a targeted retrain
 # would plausibly cover.
@@ -64,10 +77,20 @@ REGIONS = [
 
 def _recon_panels(ax_specs, title, path, *, pix, persp, predict_row, lab,
                   test_idx):
-    fig, axes = plt.subplots(len(ax_specs), 1,
-                             figsize=(14, 3.0 * len(ax_specs)),
-                             constrained_layout=True)
-    for ax, (name, loc) in zip(np.atleast_1d(axes), ax_specs):
+    """Spectrum panels, each with a percentage-residual strip underneath.
+
+    The residual is ``100 * (pred - true) / true``. In deep absorption lines
+    the true flux approaches zero and that ratio blows up while the *absolute*
+    error stays small, so pixels with ``|true| < MIN_FLUX`` are masked out
+    rather than allowed to dominate the axis; the panel reports how many were
+    dropped. The y-range is clipped to a robust percentile for the same reason.
+    """
+    n = len(ax_specs)
+    fig, axes = plt.subplots(
+        2 * n, 1, figsize=(14, 3.8 * n), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1] * n}, constrained_layout=True)
+    for i, (name, loc) in enumerate(ax_specs):
+        ax, rax = axes[2 * i], axes[2 * i + 1]
         g = int(test_idx[loc])
         pred, true = predict_row(g)
         ax.plot(pix, true, lw=0.6, color="k", label="Korg (true)")
@@ -76,7 +99,25 @@ def _recon_panels(ax_specs, title, path, *, pix, persp, predict_row, lab,
         ax.set_title(f"[{name}] RMSE={persp[loc]:.4f}   {lab(g)}",
                      fontsize=9, loc="left")
         ax.legend(loc="lower right", fontsize=8)
-    np.atleast_1d(axes)[-1].set_xlabel("pixel")
+
+        denom = np.where(np.abs(true) < MIN_FLUX, np.nan, true)
+        pct = 100.0 * (pred - true) / denom
+        n_masked = int(np.isnan(pct).sum())
+        rax.axhline(0.0, color="k", lw=0.6)
+        rax.plot(pix, pct, lw=0.5, color="C0")
+        lim = max(np.nanpercentile(np.abs(pct), 99.5), 0.05)
+        rax.set_ylim(-lim, lim)
+        rax.set_ylabel("resid [%]", fontsize=8)
+        med = np.nanmedian(np.abs(pct))
+        note = f"median |resid| = {med:.3f}%"
+        if n_masked:
+            note += f"   ({n_masked} px masked, |flux|<{MIN_FLUX})"
+        rax.text(0.005, 0.04, note, transform=rax.transAxes, fontsize=7,
+                 color="0.3", va="bottom",
+                 bbox=dict(facecolor="white", alpha=0.7, edgecolor="none",
+                           pad=1))
+        rax.tick_params(labelsize=7)
+    axes[-1].set_xlabel("pixel")
     fig.suptitle(title, fontsize=12)
     fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -98,6 +139,9 @@ def _error_distribution(persp, metrics, tag, path):
     a2.hist(persp, bins=np.logspace(np.log10(persp.min() + 1e-6),
                                     np.log10(persp.max()), 120),
             color="C0", alpha=0.85)
+    for q, c in [(50, "k"), (90, "C1"), (99, "C3")]:
+        v = np.percentile(persp, q)
+        a2.axvline(v, color=c, ls="--", lw=1, label=f"p{q}={v:.4f}")
     a2.set_xscale("log")
     a2.set_yscale("log")
     a2.set_xlabel("per-spectrum RMSE (log)")
@@ -243,10 +287,58 @@ def _corner_error(labels, persp, tag, path):
 # Driver
 # =========================================================================
 
-def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
-                 metrics_only: bool) -> dict:
+def _resolve_test_idx(run_dir: Path, ds, tag: str) -> np.ndarray:
+    """The run's test rows, as indices into ``ds``.
+
+    A run's ``split_idx.npz`` is numbered in the full-dataset row space. Under
+    the test-only fast path ``ds`` holds just the test rows, so those indices
+    have to be translated to local positions via ``ds.sub_idx`` (which is
+    sorted, so a searchsorted lookup suffices). A run whose split doesn't sit
+    inside the loaded test set can't be evaluated this way at all -- that means
+    it was trained with a different data config, so say so rather than
+    silently scoring the wrong rows.
+    """
     sp = run_dir / "split_idx.npz"
-    test_idx = np.load(sp)["test_idx"] if sp.exists() else ds.test_idx
+    if not sp.exists():
+        return ds.test_idx
+    saved = np.load(sp)["test_idx"]
+    if ds.sub_idx is None:              # full load: already the right space
+        return saved
+    pos = np.clip(np.searchsorted(ds.sub_idx, saved), 0, ds.sub_idx.size - 1)
+    bad = ds.sub_idx[pos] != saved
+    if bad.any():
+        raise SystemExit(
+            f"[eval] {tag}: {int(bad.sum()):,}/{saved.size:,} of this run's "
+            f"test rows are not in the loaded test split -- it was trained "
+            f"with a different seed/val_frac/test_frac/max_rows. Re-run with "
+            f"--full-data, or with data flags matching the run.")
+    return pos
+
+
+def _sample_positions(order, quantiles, rng, band):
+    """Positions into the RMSE ordering ``order`` for each target quantile.
+
+    With ``rng is None`` this returns the exact quantile row (the historical,
+    fully reproducible behaviour). Otherwise each pick is drawn uniformly from
+    the rows whose rank lies within ``+-band`` of the target quantile, so
+    repeated runs show *different* spectra of the same typicality.
+    """
+    n = order.size
+    out = []
+    for q in quantiles:
+        if rng is None:
+            out.append(order[min(int(round(q * (n - 1))), n - 1)])
+            continue
+        lo = int(np.floor(max(q - band, 0.0) * (n - 1)))
+        hi = int(np.ceil(min(q + band, 1.0) * (n - 1)))
+        out.append(order[rng.integers(lo, hi + 1)])
+    return out
+
+
+def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
+                 metrics_only: bool, rng=None, band: float = 0.02,
+                 worst_pool: int = 4) -> dict:
+    test_idx = _resolve_test_idx(run_dir, ds, tag)
     model, payload = load_checkpoint(run_dir / "best.pkl")
     y_mean = np.asarray(payload["y_mean"], np.float32)
     y_std = np.asarray(payload["y_std"], np.float32)
@@ -278,11 +370,12 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
     (outdir / f"{tag}_reconstruction_stats_full.json").write_text(
         json.dumps({"test_set": metrics}, indent=2))
     np.savez(outdir / f"{tag}_error_data.npz", persp=persp,
-             X_test=ds.X[test_idx], feature_names=np.array(feat))
+             X_test=ds.X[test_idx], feature_names=np.array(feat),
+             cache_row=(ds.row_idx[test_idx] if ds.row_idx is not None
+                        else test_idx))
 
     pix = np.arange(ds.n_pixels)
     order = np.argsort(persp)
-    n = order.size - 1
 
     def predict_row(g):
         yn = np.asarray(model(jnp.asarray(Xn[g:g + 1])))[0]
@@ -294,12 +387,36 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
 
     kw = dict(pix=pix, persp=persp, predict_row=predict_row, lab=lab,
               test_idx=test_idx)
-    _recon_panels([("best", order[0]), ("p25", order[n // 4]),
-                   ("median", order[n // 2]), ("p90", order[int(0.9 * n)])],
+    qs = [0.0, 0.25, 0.5, 0.9]
+    picks = _sample_positions(order, qs, rng, band)
+    names = ["best", "p25", "median", "p90"]
+    if rng is not None:                 # the label is now approximate
+        names = [f"~p{int(100 * q)}" for q in qs]
+
+    tail = order[::-1]
+    if rng is None or worst_pool <= 4:
+        worst = [(f"worst #{i + 1}", loc) for i, loc in enumerate(tail[:4])]
+    else:
+        pool = min(worst_pool, tail.size)
+        sel = np.sort(rng.choice(pool, size=4, replace=False))
+        worst = [(f"tail rank {int(r) + 1}", tail[r]) for r in sel]
+
+    # Row provenance for every panel, so a figure can be traced back to
+    # specific grid points (and reproduced by re-passing --sample-seed).
+    # ``test_idx[loc]`` is a row of ``ds``; under the fast path that is local,
+    # so map it back through row_idx to name the row in the h5 cache.
+    def cache_row(loc):
+        g = int(test_idx[loc])
+        return int(ds.row_idx[g]) if ds.row_idx is not None else g
+
+    for name, loc in list(zip(names, picks)) + worst:
+        print(f"[eval] {tag} panel {name:14s} row={cache_row(loc):,} "
+              f"rmse={persp[loc]:.5f}", flush=True)
+
+    _recon_panels(list(zip(names, picks)),
                   f"Payne ({tag}) test-set reconstructions",
                   outdir / f"{tag}_sample_reconstructions.png", **kw)
-    _recon_panels([(f"worst #{i + 1}", loc)
-                   for i, loc in enumerate(order[::-1][:4])],
+    _recon_panels(worst,
                   f"Payne ({tag}) worst test-set reconstructions",
                   outdir / f"{tag}_worst_reconstructions.png", **kw)
     _error_distribution(persp, metrics, tag,
@@ -322,6 +439,23 @@ def main():
                    help="write reconstruction_stats_full.json only, no figures")
     p.add_argument("--outdir", type=Path, default=Path("plots/payne_error_analysis"),
                    help="where figures go")
+    p.add_argument("--full-data", action="store_true",
+                   help="load the whole 40 GB dataset instead of the test-only "
+                        "cache (needed for runs whose split differs)")
+    p.add_argument("--rebuild-test-cache", action="store_true",
+                   help="rewrite the test-only sidecar before evaluating")
+    p.add_argument("--sample-seed", type=int, default=None,
+                   help="randomise which spectra the reconstruction panels "
+                        "show: each panel is drawn from a band around its "
+                        "target quantile instead of the exact quantile row. "
+                        "Omit for the deterministic exact-quantile picks.")
+    p.add_argument("--quantile-band", type=float, default=0.02,
+                   help="half-width, in quantile units, of the band each "
+                        "randomised panel is drawn from (default 0.02)")
+    p.add_argument("--worst-pool", type=int, default=4,
+                   help="with --sample-seed, draw the 4 'worst' panels from "
+                        "the top-N highest-RMSE spectra (default 4 = the "
+                        "deterministic top 4)")
     args = p.parse_args()
 
     tags = args.tags or [d.parent.name if d.name.startswith("payne_") else d.name
@@ -339,10 +473,27 @@ def main():
     base.val_frac = 0.1
     base.test_frac = 0.1
     base.seed = 0
-    ds, Xn, Yn = training.prepare_data(base)
+
+    # Evaluation reads test rows only, so by default load just those (~4 GB
+    # from a contiguous sidecar, built on first use) rather than the full
+    # ~76 GB of dataset + standardised copy. --full-data restores the old path.
+    if args.full_data:
+        ds, Xn, Yn = training.prepare_data(base)
+    else:
+        if args.rebuild_test_cache:
+            data_mod.build_test_cache(
+                target=base.target, val_frac=base.val_frac,
+                test_frac=base.test_frac, seed=base.seed,
+                max_rows=base.max_rows, rebuild=True)
+        ds, Xn, Yn = training.prepare_test_data(base)
+
+    rng = (np.random.default_rng(args.sample_seed)
+           if args.sample_seed is not None else None)
 
     for run_dir, tag in zip(args.run_dirs, tags):
-        evaluate_run(run_dir, tag, ds, Xn, Yn, args.outdir, args.metrics_only)
+        evaluate_run(run_dir, tag, ds, Xn, Yn, args.outdir, args.metrics_only,
+                     rng=rng, band=args.quantile_band,
+                     worst_pool=args.worst_pool)
 
 
 if __name__ == "__main__":

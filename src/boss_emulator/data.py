@@ -212,6 +212,13 @@ class Dataset:
     train_idx: np.ndarray
     val_idx: np.ndarray
     test_idx: np.ndarray
+    # Row provenance, set only by :func:`load_test_dataset`: this Dataset holds
+    # *only* the test rows, so its own row numbering is local. ``row_idx`` maps
+    # local row -> row in the h5 cache, ``sub_idx`` -> row in the (possibly
+    # ``max_rows``-subsampled) space that ``load_dataset`` indexes, i.e. the
+    # numbering used by a run's saved ``split_idx.npz``. None for a full load.
+    row_idx: np.ndarray | None = None
+    sub_idx: np.ndarray | None = None
 
     @property
     def n_features(self) -> int:
@@ -242,6 +249,62 @@ def _ystats_cache_path(
     key = (f"{target}_seed{seed}_val{val_frac:g}_test{test_frac:g}"
            f"_rows{max_rows}_n{n_total}")
     return cache_path.with_name(f"{cache_path.stem}.ystats.{key}.npz")
+
+
+def compute_split(
+    n_total: int, seed: int, val_frac: float, test_frac: float,
+    max_rows: int | None,
+):
+    """Reproduce a train/val/test split from its defining parameters alone.
+
+    Returns ``(rows, train_idx, val_idx, test_idx)`` where ``rows`` maps the
+    (possibly ``max_rows``-subsampled) row space to rows of the h5 cache and
+    the three index arrays are sorted positions *within* that subsampled space.
+
+    The split depends only on ``(n_total, seed, val_frac, test_frac,
+    max_rows)`` -- not on which labels are selected -- which is what lets both
+    :func:`load_dataset` and :func:`build_test_cache` derive it identically.
+    Keep the RNG draw order (choice, then permutation) untouched: changing it
+    silently re-splits every existing run.
+    """
+    rng = np.random.default_rng(seed)
+    if max_rows is not None and max_rows < n_total:
+        rows = np.sort(rng.choice(n_total, size=max_rows, replace=False))
+    else:
+        rows = np.arange(n_total)
+
+    n = rows.size
+    perm = rng.permutation(n)
+    n_val = int(round(val_frac * n))
+    n_test = int(round(test_frac * n))
+    if n_val + n_test >= n:
+        raise ValueError(
+            f"val_frac + test_frac too large ({val_frac} + {test_frac}) "
+            f"for n={n}")
+    return (rows,
+            np.sort(perm[n_test + n_val:]),
+            np.sort(perm[n_test:n_test + n_val]),
+            np.sort(perm[:n_test]))
+
+
+def _read_ystats_cache(path: Path, n_pixels: int):
+    """Return ``(y_mean, y_std)`` from the sidecar, or None if absent/stale."""
+    if not path.exists():
+        return None
+    with np.load(path) as st:
+        y_mean, y_std = st["y_mean"], st["y_std"]
+    if y_mean.shape != (n_pixels,) or y_std.shape != (n_pixels,):
+        return None
+    print(f"[data] loaded cached target stats: {path.name}")
+    return y_mean, y_std
+
+
+def _write_ystats_cache(path: Path, y_mean: np.ndarray, y_std: np.ndarray):
+    try:
+        np.savez(path, y_mean=y_mean, y_std=y_std)
+        print(f"[data] cached target stats -> {path.name}")
+    except OSError as e:  # non-fatal: stats are still returned in-memory
+        print(f"[data] warning: could not write stats cache ({e})")
 
 
 def _compute_y_stats(Y: np.ndarray, train_idx: np.ndarray, n_pixels: int):
@@ -330,23 +393,21 @@ def load_dataset(
         raise FileNotFoundError(
             f"cache {cache_path} not found -- run build_cache() first")
 
-    rng = np.random.default_rng(seed)
-
     with h5py.File(cache_path, "r") as f:
         n_total = int(f.attrs["n_converged"])
         n_pixels = int(f.attrs["n_pixels"])
+
+        # Train / validation / test split. Val monitors the loss during
+        # training; test is held out for final reconstruction metrics.
+        rows, train_idx, val_idx, test_idx = compute_split(
+            n_total, seed, val_frac, test_frac, max_rows)
 
         # Row subset. For the common full-dataset case we read with a plain
         # slice (`[:]`): h5py fancy indexing with an explicit index array is
         # ~2.5x slower than a contiguous slice for the 38 GB target, so we
         # only pay that cost when actually subsampling (``max_rows``).
         subsample = max_rows is not None and max_rows < n_total
-        if subsample:
-            rows = np.sort(rng.choice(n_total, size=max_rows, replace=False))
-            sel = rows                       # h5py fancy index
-        else:
-            rows = np.arange(n_total)
-            sel = slice(None)                # full contiguous read (fast path)
+        sel = rows if subsample else slice(None)
 
         # Inputs: core labels then chosen abundances.
         x_cols = [f[name][sel] for name in core_labels]
@@ -362,20 +423,6 @@ def load_dataset(
         Y = f[target][sel, :].astype("float32", copy=False)
 
     feature_names = list(core_labels) + [f"A({s})" for s in abundance_elements]
-    n = X.shape[0]
-
-    # Train / validation / test split. Val monitors the loss during
-    # training; test is held out for final reconstruction metrics.
-    perm = rng.permutation(n)
-    n_val = int(round(val_frac * n))
-    n_test = int(round(test_frac * n))
-    if n_val + n_test >= n:
-        raise ValueError(
-            f"val_frac + test_frac too large ({val_frac} + {test_frac}) "
-            f"for n={n}")
-    test_idx = np.sort(perm[:n_test])
-    val_idx = np.sort(perm[n_test:n_test + n_val])
-    train_idx = np.sort(perm[n_test + n_val:])
 
     # Standardisation stats from the training split only.
     x_mean = X[train_idx].mean(axis=0)
@@ -387,20 +434,12 @@ def load_dataset(
         # ``.npz`` next to the preprocessed dataset and reuse across runs.
         stats_path = _ystats_cache_path(
             cache_path, target, seed, val_frac, test_frac, max_rows, n_total)
-        if stats_path.exists():
-            with np.load(stats_path) as st:
-                y_mean, y_std = st["y_mean"], st["y_std"]
-            if y_mean.shape == (n_pixels,) and y_std.shape == (n_pixels,):
-                print(f"[data] loaded cached target stats: {stats_path.name}")
-            else:  # stale/mismatched cache -> recompute
-                y_mean, y_std = _compute_y_stats(Y, train_idx, n_pixels)
+        cached = _read_ystats_cache(stats_path, n_pixels)
+        if cached is not None:
+            y_mean, y_std = cached
         else:
             y_mean, y_std = _compute_y_stats(Y, train_idx, n_pixels)
-            try:
-                np.savez(stats_path, y_mean=y_mean, y_std=y_std)
-                print(f"[data] cached target stats -> {stats_path.name}")
-            except OSError as e:  # non-fatal: stats still returned in-memory
-                print(f"[data] warning: could not write stats cache ({e})")
+            _write_ystats_cache(stats_path, y_mean, y_std)
     else:
         y_mean = np.zeros(n_pixels, dtype="float32")
         y_std = np.ones(n_pixels, dtype="float32")
@@ -410,6 +449,222 @@ def load_dataset(
         x_mean=x_mean.astype("float32"), x_std=x_std.astype("float32"),
         y_mean=y_mean.astype("float32"), y_std=y_std.astype("float32"),
         train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+    )
+
+
+# =========================================================================
+# Test-set cache (for evaluation)
+# =========================================================================
+#
+# Evaluation only ever touches test rows (10% of the grid), so loading the
+# full 40 GB target -- plus the ~38 GB standardised copy -- is ~10x more work
+# than the job needs. Fancy-indexing the test rows straight out of the main
+# cache does *not* help: the target is chunked at (4096, n_pixels) = 73 MB and
+# a uniformly-scattered 10% sample touches essentially every chunk, so HDF5
+# still reads ~40 GB (and may re-read chunks, given the small default chunk
+# cache). Instead we pay one sequential pass to write the test rows out
+# *contiguously*, then every later evaluation reads just those ~4 GB.
+
+TEST_CACHE_COLUMNS = list(CORE_LABELS) + list(ABUNDANCE_ELEMENTS)
+
+
+def test_cache_path(
+    cache_path: Path, target: str, seed: int, val_frac: float,
+    test_frac: float, max_rows: int | None, n_total: int,
+) -> Path:
+    """Sidecar path for the contiguous test-row cache.
+
+    Keyed exactly like :func:`_ystats_cache_path` -- the contents depend only
+    on the split, not on which labels a given run selected (every label column
+    is stored, and callers subset them).
+    """
+    key = (f"{target}_seed{seed}_val{val_frac:g}_test{test_frac:g}"
+           f"_rows{max_rows}_n{n_total}")
+    return cache_path.with_name(f"{cache_path.stem}.testset.{key}.npz")
+
+
+def build_test_cache(
+    target: str = "norm_flux",
+    cache_path: Path = CACHE_PATH,
+    val_frac: float = 0.1,
+    test_frac: float = 0.1,
+    seed: int = 0,
+    max_rows: int | None = None,
+    block: int = 50_000,
+    rebuild: bool = False,
+) -> Path:
+    """Write the test rows of the main cache to a compact contiguous sidecar.
+
+    One sequential pass over the target: each block is read with a contiguous
+    slice, the test rows in it are copied to the output, and the train rows
+    feed a streaming accumulation of the per-pixel target stats (reusing the
+    ystats sidecar instead when one already exists, so the numbers match runs
+    trained against it exactly).
+
+    Costs one ~40 GB read (about what a single full ``load_dataset`` already
+    pays) and writes ~4 GB. No-op if the sidecar is present and ``rebuild`` is
+    False. Returns its path.
+    """
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"cache {cache_path} not found -- run build_cache() first")
+
+    with h5py.File(cache_path, "r") as f:
+        n_total = int(f.attrs["n_converged"])
+        n_pixels = int(f.attrs["n_pixels"])
+        out_path = test_cache_path(cache_path, target, seed, val_frac,
+                                   test_frac, max_rows, n_total)
+        if out_path.exists() and not rebuild:
+            print(f"[data] test cache already present: {out_path.name}")
+            return out_path
+
+        rows, train_idx, val_idx, test_idx = compute_split(
+            n_total, seed, val_frac, test_frac, max_rows)
+
+        # Labels are cheap (~250 MB for every column at the full grid), so
+        # read them all and store the whole table; callers subset columns.
+        subsample = max_rows is not None and max_rows < n_total
+        sel = rows if subsample else slice(None)
+        ab = f["abundances"][sel, :]
+        X_all = np.stack(
+            [f[name][sel] for name in CORE_LABELS]
+            + [ab[:, c] for c in range(len(ABUNDANCE_ELEMENTS))],
+            axis=1).astype("float32")
+        del ab
+        x_mean = X_all[train_idx].mean(axis=0)
+        x_std = X_all[train_idx].std(axis=0)
+        x_std[x_std == 0] = 1.0
+
+        # Role of each *file* row, so a sequential scan can classify blocks.
+        file_test = np.zeros(n_total, dtype=bool)
+        file_train = np.zeros(n_total, dtype=bool)
+        file_test[rows[test_idx]] = True
+        file_train[rows[train_idx]] = True
+
+        n_test = test_idx.size
+        Y_test = np.empty((n_test, n_pixels), dtype="float32")
+        stats = _read_ystats_cache(
+            _ystats_cache_path(cache_path, target, seed, val_frac, test_frac,
+                               max_rows, n_total), n_pixels)
+        need_stats = stats is None
+        s = np.zeros(n_pixels, dtype=np.float64)
+        ss = np.zeros(n_pixels, dtype=np.float64)
+        n_train_seen = 0
+
+        dset = f[target]
+        write = 0
+        for start in range(0, n_total, block):
+            stop = min(start + block, n_total)
+            mt = file_test[start:stop]
+            mr = file_train[start:stop]
+            if not (mt.any() or (need_stats and mr.any())):
+                continue
+            blk = dset[start:stop, :]           # contiguous read
+            k = int(mt.sum())
+            if k:
+                Y_test[write:write + k] = blk[mt]
+                write += k
+            if need_stats and mr.any():
+                tr = blk[mr].astype(np.float64)
+                s += tr.sum(axis=0)
+                ss += (tr * tr).sum(axis=0)
+                n_train_seen += tr.shape[0]
+            print(f"\r[data] building test cache: {write:,}/{n_test:,} rows",
+                  end="", flush=True)
+        print()
+        assert write == n_test, (write, n_test)
+
+    # ``file_test`` is scanned in ascending file order and ``rows[test_idx]``
+    # is sorted, so Y_test rows land in the same order as ``X_all[test_idx]``.
+    if need_stats:
+        y_mean = s / n_train_seen
+        y_std = np.sqrt(np.maximum(ss / n_train_seen - y_mean ** 2, 0.0))
+        y_std[y_std == 0] = 1.0
+        y_mean, y_std = y_mean.astype("float32"), y_std.astype("float32")
+        _write_ystats_cache(
+            _ystats_cache_path(cache_path, target, seed, val_frac, test_frac,
+                               max_rows, n_total), y_mean, y_std)
+    else:
+        y_mean, y_std = stats
+
+    # Written via a handle, not a path: ``np.savez`` would append a second
+    # ``.npz`` to a temp name that doesn't already end in one.
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp_path, "wb") as fh:
+        np.savez(
+            fh, Y=Y_test, X=X_all[test_idx],
+            columns=np.array(TEST_CACHE_COLUMNS, dtype="S8"),
+            x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std,
+            row_idx=rows[test_idx].astype("int64"),
+            sub_idx=test_idx.astype("int64"),
+            n_total=np.int64(n_total), n_pixels=np.int64(n_pixels),
+            n_train=np.int64(train_idx.size), n_val=np.int64(val_idx.size),
+        )
+    tmp_path.replace(out_path)
+    gb = out_path.stat().st_size / 1e9
+    print(f"[data] wrote test cache {out_path.name} "
+          f"({n_test:,} rows, {gb:.1f} GB)")
+    return out_path
+
+
+def load_test_dataset(
+    core_labels: list[str] | None = None,
+    abundance_elements: list[str] | None = None,
+    target: str = "norm_flux",
+    cache_path: Path = CACHE_PATH,
+    val_frac: float = 0.1,
+    test_frac: float = 0.1,
+    seed: int = 0,
+    max_rows: int | None = None,
+    standardize_y: bool = True,
+    rebuild: bool = False,
+) -> Dataset:
+    """Load a test-rows-only :class:`Dataset`, building the sidecar if needed.
+
+    The returned Dataset is *locally* numbered: ``X``/``Y`` hold only test
+    rows, ``test_idx`` is ``arange(n_test)``, ``train_idx``/``val_idx`` are
+    empty (the rows simply aren't here), and ``row_idx``/``sub_idx`` record
+    where each row came from. Standardisation stats are the train-split ones,
+    identical to :func:`load_dataset`, so metrics are directly comparable.
+    """
+    core_labels = list(core_labels) if core_labels is not None else list(CORE_LABELS)
+    abundance_elements = list(abundance_elements) if abundance_elements else []
+    for name in core_labels:
+        if name not in CORE_LABELS:
+            raise ValueError(f"unknown core label {name!r}; choose from {CORE_LABELS}")
+    _resolve_abundances(abundance_elements)     # validates the symbols
+
+    path = build_test_cache(
+        target=target, cache_path=cache_path, val_frac=val_frac,
+        test_frac=test_frac, seed=seed, max_rows=max_rows, rebuild=rebuild)
+
+    with np.load(path) as z:
+        columns = [c.decode() for c in z["columns"]]
+        want = list(core_labels) + list(abundance_elements)
+        cols = [columns.index(name) for name in want]
+        X = np.ascontiguousarray(z["X"][:, cols])
+        Y = z["Y"]
+        x_mean, x_std = z["x_mean"][cols], z["x_std"][cols]
+        y_mean, y_std = z["y_mean"], z["y_std"]
+        row_idx, sub_idx = z["row_idx"], z["sub_idx"]
+        n_pixels = int(z["n_pixels"])
+        n_train, n_val = int(z["n_train"]), int(z["n_val"])
+
+    if not standardize_y:
+        y_mean = np.zeros(n_pixels, dtype="float32")
+        y_std = np.ones(n_pixels, dtype="float32")
+
+    feature_names = list(core_labels) + [f"A({s})" for s in abundance_elements]
+    print(f"[data] test-only load: n_test={Y.shape[0]:,} "
+          f"n_pixels={n_pixels} (train={n_train:,} val={n_val:,} not loaded)")
+    empty = np.empty(0, dtype="int64")
+    return Dataset(
+        X=X, Y=Y, feature_names=feature_names, n_pixels=n_pixels,
+        x_mean=x_mean.astype("float32"), x_std=x_std.astype("float32"),
+        y_mean=y_mean.astype("float32"), y_std=y_std.astype("float32"),
+        train_idx=empty, val_idx=empty, test_idx=np.arange(Y.shape[0]),
+        row_idx=row_idx, sub_idx=sub_idx,
     )
 
 

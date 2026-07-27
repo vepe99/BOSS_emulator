@@ -229,6 +229,34 @@ def prepare_data(args) -> tuple["data_mod.Dataset", np.ndarray, np.ndarray]:
     return ds, Xn, Yn
 
 
+def prepare_test_data(args) -> tuple["data_mod.Dataset", np.ndarray, np.ndarray]:
+    """:func:`prepare_data` restricted to the test split -- for evaluation.
+
+    Same signature and return shape, but the arrays hold only the ~10% of rows
+    an evaluation actually reads, so this costs ~4 GB and seconds instead of
+    ~76 GB and minutes. The returned Dataset is locally numbered; see
+    :func:`data_mod.load_test_dataset`. Requires the same ``args`` fields, so
+    the split matches the runs being evaluated.
+    """
+    data_mod.build_cache(rebuild=args.rebuild_cache)
+    print(f"[eval] loading test split: labels={args.labels} "
+          f"abundances={args.abundances or 'none'}")
+    ds = data_mod.load_test_dataset(
+        core_labels=args.labels,
+        abundance_elements=args.abundances,
+        target=args.target,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
+        seed=args.seed,
+        max_rows=args.max_rows,
+        standardize_y=not args.no_standardize_y,
+    )
+    print(f"[eval] features ({ds.n_features}): {ds.feature_names}")
+    Xn = ds.normalize_x(ds.X).astype("float32")
+    Yn = ds.normalize_y(ds.Y).astype("float32")
+    return ds, Xn, Yn
+
+
 # =========================================================================
 # Training loop
 # =========================================================================
