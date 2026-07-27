@@ -279,16 +279,22 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
     else:
         ds, Xn, Yn = prepared
 
-    # Stage the *training* split resident on the GPU so each epoch gathers its
-    # batches on-device instead of re-copying ~32 GB host->device every epoch
-    # (that per-epoch copy, not compute, was the training-loop bottleneck --
-    # the loop was host-starved, which is also why batch size did not help).
-    # Validation still streams from the host arrays via evaluate(): it is ~10%
-    # the size and produces the physical per-spectrum metrics the objective
-    # needs, so Xn/Yn are kept on the host for it.
+    # Stage the train AND validation splits resident on the GPU so every epoch
+    # -- both the training steps and the validation pass -- gathers its batches
+    # on-device instead of re-copying data host->device each epoch (~32 GB for
+    # train, ~4 GB for val). That per-epoch host round-trip, not compute, was
+    # the bottleneck (the loop was host-starved, which is also why batch size
+    # did not help). Batches are formed from shuffled *positions* into these
+    # resident arrays; with the same seed this reproduces the exact same batches
+    # as indexing the global rows, so behaviour is unchanged -- only faster.
+    # The host copies Xn/Yn are kept only for the end-of-trial test-set metrics
+    # (full_reconstruction_metrics), which run once, not per epoch.
     Xtr = jax.device_put(Xn[ds.train_idx])
     Ytr = jax.device_put(Yn[ds.train_idx])
     train_pos = np.arange(ds.train_idx.size)
+    Xva = jax.device_put(Xn[ds.val_idx])
+    Yva = jax.device_put(Yn[ds.val_idx])
+    val_pos = np.arange(ds.val_idx.size)
 
     # 4. Model + optimizer (Adam with cosine decay).
     model_kwargs = {}
@@ -354,10 +360,10 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
                 loss = train_step(model, optimizer, Xtr[batch], Ytr[batch])
                 train_losses.append(loss)  # device scalar; reduced once/epoch
 
-            # Validation (batched). Switch to eval mode so dropout is disabled,
-            # then back to train mode for the next epoch.
+            # Validation (batched, device-resident). Switch to eval mode so
+            # dropout is disabled, then back to train mode for the next epoch.
             model.eval()
-            va, persp = evaluate(model, Xn, Yn, ds.val_idx, y_std_dev,
+            va, persp = evaluate(model, Xva, Yva, val_pos, y_std_dev,
                                  args.batch_size)
             model.train()
             obj = float(np.median(persp)) if persp.size else float("nan")

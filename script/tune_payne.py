@@ -76,7 +76,7 @@ def suggest_config(trial: optuna.Trial) -> dict:
         "weight_decay": trial.suggest_float(
             "weight_decay", 1e-6, 1e-3, log=True),
         "batch_size": trial.suggest_categorical(
-            "batch_size", [512, 1024, 2048, 4096]),
+            "batch_size", [512, 1024, 2048, 4096, 8192, 16384]),
     }
 
 
