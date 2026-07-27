@@ -15,6 +15,7 @@ dependencies = [
     "h5py>=3.16.0",
     "flax>=0.12.8",
     "optax>=0.2.8",
+    "optuna>=4.9.0",
 ]
 
 [build-system]

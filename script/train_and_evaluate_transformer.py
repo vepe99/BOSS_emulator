@@ -232,7 +232,7 @@ def main():
     train_args.max_rows = args.max_rows
     train_args.outdir = args.outdir
 
-    run_dir, ds = training.train(train_args)
+    run_dir, ds, _best_obj = training.train(train_args)
 
     # 2. Reload the best checkpoint for the best-val weights. The dataset (and
     #    its train/val/test split) is reused from training rather than

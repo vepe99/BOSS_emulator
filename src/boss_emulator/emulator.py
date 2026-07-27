@@ -37,6 +37,27 @@ from flax import nnx
 
 Activation = Callable[[jax.Array], jax.Array]
 
+# Named activations, so a hyper-parameter search can pick one by string and it
+# survives a checkpoint round-trip (a bare callable is not picklable/portable).
+ACTIVATIONS: dict[str, Activation] = {
+    "gelu": nnx.gelu,
+    "silu": nnx.silu,
+    "relu": nnx.relu,
+    "tanh": nnx.tanh,
+}
+
+
+def resolve_activation(activation: str | Activation) -> Activation:
+    """Map an activation name to its callable (pass callables through)."""
+    if callable(activation):
+        return activation
+    try:
+        return ACTIVATIONS[activation]
+    except KeyError:
+        raise ValueError(
+            f"unknown activation {activation!r}; choose from "
+            f"{sorted(ACTIVATIONS)}") from None
+
 
 def _mlp_layers(
     rngs: nnx.Rngs,
@@ -63,12 +84,23 @@ class PayneMLP(nnx.Module):
         Length of the output spectrum.
     hidden : sequence of int
         Hidden layer widths.
-    activation : callable
-        Nonlinearity applied between hidden layers (default GELU).
+    activation : str or callable
+        Nonlinearity applied between hidden layers (default GELU). May be a
+        name from :data:`ACTIVATIONS` so it round-trips through a checkpoint.
     dropout : float
         Dropout rate applied to each hidden activation (0.0 disables it,
         and then no Dropout module is created at all). Active only in
         training mode; call ``model.eval()`` for deterministic inference.
+    residual : bool
+        If True, add a residual (skip) connection around each hidden block
+        whose input and output widths match. The first hidden layer projects
+        ``n_features -> hidden[0]`` (widths differ, so no skip); every later
+        equal-width hidden layer gets ``x = x + block(x)``. Skip connections
+        ease optimisation of deeper stacks and reduce depth sensitivity.
+    layernorm : bool
+        If True, apply pre-activation LayerNorm at each hidden layer
+        (``activation(layer(LN(x)))``), which stabilises training of deeper
+        or higher-LR configurations.
     """
 
     def __init__(
@@ -76,22 +108,35 @@ class PayneMLP(nnx.Module):
         n_features: int,
         n_pixels: int,
         hidden: Sequence[int] = (512, 512, 512),
-        activation: Activation = nnx.gelu,
+        activation: str | Activation = nnx.gelu,
         dropout: float = 0.0,
+        residual: bool = False,
+        layernorm: bool = False,
         *,
         rngs: nnx.Rngs,
     ):
         self.layers = nnx.data(_mlp_layers(rngs, n_features, hidden, n_pixels))
-        self.activation = activation
+        self.activation = resolve_activation(activation)
         self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
+        self.residual = residual
+        # One pre-activation LayerNorm per hidden layer (input widths), or None.
+        if layernorm:
+            in_dims = [n_features, *hidden]  # input width of each hidden layer
+            self.norms = nnx.data(
+                [nnx.LayerNorm(d, rngs=rngs) for d in in_dims])
+        else:
+            self.norms = None
         self.n_features = n_features
         self.n_pixels = n_pixels
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        for layer in self.layers[:-1]:
-            x = self.activation(layer(x))
+        for i, layer in enumerate(self.layers[:-1]):
+            h = self.norms[i](x) if self.norms is not None else x
+            h = self.activation(layer(h))
             if self.dropout is not None:
-                x = self.dropout(x)
+                h = self.dropout(h)
+            # Skip connection only where the block preserves the width.
+            x = x + h if (self.residual and h.shape[-1] == x.shape[-1]) else h
         return self.layers[-1](x)  # linear output head
 
 
@@ -306,7 +351,12 @@ def build_model(
     seed: int = 0,
     **kwargs,
 ) -> nnx.Module:
-    """Factory: construct a model by name ('payne', 'deeponet', 'transformer')."""
+    """Factory: construct a model by name.
+
+    Known names: ``'payne'``, ``'deeponet'``, ``'transformer'`` and
+    ``'singlelambda'`` (the coordinate-query cross-attention emulator, whose
+    forward is ``model(x, coords)`` rather than ``model(x)``).
+    """
     rngs = nnx.Rngs(seed)
     name = name.lower()
     if name == "payne":
@@ -315,8 +365,16 @@ def build_model(
         return DeepONet(n_features, n_pixels, rngs=rngs, **kwargs)
     if name == "transformer":
         return SpectraFormer(n_features, n_pixels, rngs=rngs, **kwargs)
+    if name == "singlelambda":
+        # Deferred import: the submodule imports _CrossAttnBlock from this
+        # module at its top level, so importing it here avoids a cycle.
+        from boss_emulator.singlelambda.emulator_singlelambda import (
+            SpectraFormerSingleLambda)
+        return SpectraFormerSingleLambda(
+            n_features, n_pixels, rngs=rngs, **kwargs)
     raise ValueError(
-        f"unknown model {name!r}; choose 'payne', 'deeponet' or 'transformer'")
+        f"unknown model {name!r}; choose 'payne', 'deeponet', "
+        f"'transformer' or 'singlelambda'")
 
 
 def load_checkpoint(path):
