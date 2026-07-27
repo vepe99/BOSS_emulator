@@ -9,6 +9,7 @@ likelihood, one shared results format so they can be compared directly.
 | `run_curve_fit.py` | `scipy.optimize.curve_fit` / bounded `least_squares`, JAX Jacobian | one spectrum at a time, serial (~1-2 s each) | point estimate + linearised covariance |
 | `run_gradient.py` | projected Adam on the chi-square + batched Levenberg-Marquardt polish | all spectra *and* all restarts in one jitted step (~ms each) | MAP estimate + Gauss-Newton covariance |
 | `run_nuts.py` | NumPyro NUTS | one MCMC per spectrum (minutes each) | full posterior, credible intervals, r_hat/ESS, coverage |
+| `diagnose_manifold.py` | directional derivatives of the emulator | one pass over N spectra (seconds) | how much label sensitivity the redundant `A(X)` channels absorb |
 
 `common.py` holds everything they share: the emulator wrapped as a jitted
 differentiable forward map, target selection and noise, the chi-square, the MAP
@@ -16,12 +17,47 @@ optimiser, and the reporting/plotting/serialisation.
 
 ## The two choices that decide what a run measures
 
-**Which labels are free** (`--fit-labels`). The emulator takes 27 inputs: the 6
-core labels plus 21 element abundances that are largely redundant with
-`m_H`/`alpha_m`/`carbon_m`. Fitting all 27 from a single spectrum is badly
-degenerate, so by default only the core 6 float and the abundances are held at
-their true values. That separates "can we invert the emulator" from "is the
-parametrisation identifiable at all".
+**How the abundances are handled** (`--abund-mode`). The emulator takes 27
+inputs, but they are not 27 degrees of freedom. In the Korg grid
+
+```
+A(E) = A_sun(E) + m_H + alpha_m·[E ∈ {O,Mg,Si,S,Ca,Ti}] + carbon_m·[E == C]
+```
+
+holds *exactly* — `common.abundance_slaving` re-verifies it against the loaded
+split on every run and refuses to proceed if it ever stops holding. So the
+inputs lie on a 6-dimensional manifold, and what to do with the 21 redundant
+channels is the single most consequential choice in these scripts:
+
+* `slaved` (**default**) — recompute the abundances from the free core labels
+  through the relation above. Six free parameters, which is the grid's true
+  dimensionality; every query stays on the manifold the emulator was trained
+  on; nothing leaks.
+* `fixed` — hold them at the truth. This *leaks the answer*: `A(Fe)` known
+  means `m_H` known. Measured on 256 test spectra, only 6% of the emulator's
+  metallicity sensitivity is left on the `m_H` input once `A(X)` is pinned
+  (`|∂flux/∂m_H|` = 5.3e-3 per dex vs 8.9e-2 on-manifold, against a noise floor
+  of 1e-2). For `alpha_m` and `carbon_m` the direct derivative is 3-8× *larger*
+  than the on-manifold one and partially cancels it — the network distributed
+  the redundant signal across the duplicate channels arbitrarily, as a network
+  trained on a degenerate parametrisation will.
+* `free` — fit all 27 independently. Off-manifold extrapolation: it fits
+  spectra (`chi2/pixel = 6e-3` in the noiseless control) and recovers nothing,
+  every label landing at prior width. Kept so that claim stays checkable.
+
+The three, on the identical noiseless control (64 targets, 8 restarts, LM
+polish), as `rmse` / prior range:
+
+| label | `free` | `fixed` | `slaved` |
+|---|---|---|---|
+| Teff | 0.214 | 0.0672 | **0.0041** (22 K) |
+| logg | 0.230 | 0.0651 | **0.0265** |
+| m_H | 0.408 | 0.307 | **0.0226** (0.082 dex) |
+| alpha_m | 0.237 | 0.0806 | **0.0177** |
+| carbon_m | 0.294 | 0.123 | **0.0908** |
+| vmic | 0.303 | 0.228 | **0.131** |
+
+`--fit-labels` still selects which *core* labels float.
 
 **What counts as the data** (`--obs`).
 
@@ -56,6 +92,13 @@ UV_CACHE_DIR=... uv run python script/inv_model/run_curve_fit.py \
 # posterior audit of a handful of spectra
 UV_CACHE_DIR=... uv run python script/inv_model/run_nuts.py \
     --run $RUN --n-targets 16 --chains 4
+
+# what the redundant abundance channels are worth: same control, three modes
+for m in slaved fixed free; do
+    UV_CACHE_DIR=... uv run python script/inv_model/run_gradient.py \
+        --run $RUN --tag ctl_$m --abund-mode $m \
+        --obs emulator --noiseless --n-targets 64 --n-restarts 8
+done
 ```
 
 ### NUTS runtime
@@ -109,15 +152,20 @@ the data cannot resolve -- raise `--n-restarts`, and look at the NUTS corner
 plots to see whether the ridge passes through the truth (degeneracy) or misses
 it (bias).
 
-That is not hypothetical here. In the well-specified control
-(`--obs emulator --noiseless`, 64 targets, 8 random restarts, LM polish) the
-median fit reaches `chi2/pixel = 3e-5` -- essentially exact -- yet the label
-errors are heavy-tailed: Teff MAE 133 K but RMSE 363 K, m_H MAE 0.67 dex but
-RMSE 1.1 dex. Most spectra invert cleanly and a minority land on a distant
-label vector that reproduces the spectrum just as well. Since there is no noise
-and no misspecification in that run, the cause is the emulator's own
-label->spectrum map, not the fitting: worth chasing with the corner plots before
-reading anything into the `--obs korg` numbers.
+That is not hypothetical here, and it had a mundane cause worth recording. The
+first version of these scripts held the abundances fixed at truth, and in the
+well-specified control the median fit reached `chi2/pixel = 3e-5` -- essentially
+exact -- while the label errors were heavy-tailed: Teff MAE 133 K but RMSE
+363 K, m_H MAE 0.67 dex but RMSE 1.1 dex. That looked like a degeneracy in the
+emulator's own label->spectrum map, since the run had neither noise nor
+misspecification.
+
+It was not. It was the off-manifold parametrisation described above: with
+`A(X)` pinned, the free `m_H` input carries almost none of the metallicity
+signal, so the chi-square is nearly flat along it and a minority of spectra
+drift far away at no cost. Switching to `--abund-mode slaved` cuts m_H RMSE
+from 1.116 to 0.082 dex and Teff from 363 to 22 K with everything else
+identical. **Diagnose the parametrisation before blaming the emulator.**
 
 `pull_std` (the spread of `(est - truth)/err`) and `coverage_1sigma` are the
 honesty check on the error bars. `pull_std >> 1` with `--obs korg` and
