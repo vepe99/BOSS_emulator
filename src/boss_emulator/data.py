@@ -33,6 +33,7 @@ labels the user asked for.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,8 +46,18 @@ RAW_PATH = Path("/export/data/vgiusepp/BOSS_emulator/data/korg_grid.h5")
 
 # Project root = parent of the ``src`` directory that holds this package.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CACHE_DIR = PROJECT_ROOT / "preprocessed_data"
-CACHE_PATH = CACHE_DIR / "korg_grid_train.h5"
+# Cache location. Defaults to ``<project>/preprocessed_data`` but can be
+# redirected to a shared, pre-built cache without editing code or symlinking:
+#   * ``BOSS_CACHE_DIR``  -- directory holding ``korg_grid_train.h5`` and its
+#     ``.ystats.*.npz`` sidecars;
+#   * ``BOSS_CACHE_PATH`` -- full path to the cache file itself (takes
+#     precedence; sidecars are looked up next to it).
+CACHE_DIR = Path(os.environ.get("BOSS_CACHE_DIR") or (PROJECT_ROOT / "preprocessed_data"))
+CACHE_PATH = (
+    Path(os.environ["BOSS_CACHE_PATH"])
+    if os.environ.get("BOSS_CACHE_PATH")
+    else CACHE_DIR / "korg_grid_train.h5"
+)
 
 # --- grid constants (verified against the raw file) ----------------------
 

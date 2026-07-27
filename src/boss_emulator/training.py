@@ -279,6 +279,17 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
     else:
         ds, Xn, Yn = prepared
 
+    # Stage the *training* split resident on the GPU so each epoch gathers its
+    # batches on-device instead of re-copying ~32 GB host->device every epoch
+    # (that per-epoch copy, not compute, was the training-loop bottleneck --
+    # the loop was host-starved, which is also why batch size did not help).
+    # Validation still streams from the host arrays via evaluate(): it is ~10%
+    # the size and produces the physical per-spectrum metrics the objective
+    # needs, so Xn/Yn are kept on the host for it.
+    Xtr = jax.device_put(Xn[ds.train_idx])
+    Ytr = jax.device_put(Yn[ds.train_idx])
+    train_pos = np.arange(ds.train_idx.size)
+
     # 4. Model + optimizer (Adam with cosine decay).
     model_kwargs = {}
     if args.hidden:
@@ -336,11 +347,12 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
             t0 = time.time()
             train_losses = []
             for batch in data_mod.iter_batches(
-                    ds.train_idx, args.batch_size, seed=args.seed + epoch):
-                xb = jnp.asarray(Xn[batch])
-                yb = jnp.asarray(Yn[batch])
-                loss = train_step(model, optimizer, xb, yb)
-                train_losses.append(float(loss))
+                    train_pos, args.batch_size, seed=args.seed + epoch):
+                # Positions index the device-resident train split; permuting
+                # positions with the same seed reproduces the exact same
+                # batches as permuting the global row indices did.
+                loss = train_step(model, optimizer, Xtr[batch], Ytr[batch])
+                train_losses.append(loss)  # device scalar; reduced once/epoch
 
             # Validation (batched). Switch to eval mode so dropout is disabled,
             # then back to train mode for the next epoch.
@@ -350,7 +362,7 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
             model.train()
             obj = float(np.median(persp)) if persp.size else float("nan")
 
-            tr = float(np.mean(train_losses))
+            tr = float(jnp.mean(jnp.stack(train_losses)))
             dt = time.time() - t0
             print(f"[train] epoch {epoch + 1:4d}/{args.epochs}  "
                   f"train_mse={tr:.4e}  val_mse={va:.4e}  "
