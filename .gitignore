@@ -1,5 +1,9 @@
 *.png
 *.pdf
 *.h5
-*.pkl 
+*.pkl
 *.npz
+__pycache__/
+*.pyc
+trained_model/
+plots/
