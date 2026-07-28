@@ -64,7 +64,7 @@ from boss_emulator.emulator import load_checkpoint
 def suggest_config(trial: optuna.Trial) -> dict:
     """Sample one Payne configuration from the search space."""
     n_layers = trial.suggest_int("n_layers", 3, 8)
-    width = trial.suggest_categorical("width", [512, 1024, 2048])
+    width = trial.suggest_int("width", 800, 4096)
     return {
         "hidden": [width] * n_layers,
         "activation": trial.suggest_categorical(

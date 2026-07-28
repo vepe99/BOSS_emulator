@@ -337,7 +337,7 @@ def _sample_positions(order, quantiles, rng, band):
 
 def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
                  metrics_only: bool, rng=None, band: float = 0.02,
-                 worst_pool: int = 4) -> dict:
+                 worst_pool: int = 4, n_worst: int = 4) -> dict:
     test_idx = _resolve_test_idx(run_dir, ds, tag)
     model, payload = load_checkpoint(run_dir / "best.pkl")
     y_mean = np.asarray(payload["y_mean"], np.float32)
@@ -394,11 +394,12 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
         names = [f"~p{int(100 * q)}" for q in qs]
 
     tail = order[::-1]
-    if rng is None or worst_pool <= 4:
-        worst = [(f"worst #{i + 1}", loc) for i, loc in enumerate(tail[:4])]
+    if rng is None or worst_pool <= n_worst:
+        worst = [(f"worst #{i + 1}", loc)
+                 for i, loc in enumerate(tail[:n_worst])]
     else:
         pool = min(worst_pool, tail.size)
-        sel = np.sort(rng.choice(pool, size=4, replace=False))
+        sel = np.sort(rng.choice(pool, size=n_worst, replace=False))
         worst = [(f"tail rank {int(r) + 1}", tail[r]) for r in sel]
 
     # Row provenance for every panel, so a figure can be traced back to
@@ -439,6 +440,11 @@ def main():
                    help="write reconstruction_stats_full.json only, no figures")
     p.add_argument("--outdir", type=Path, default=Path("plots/payne_error_analysis"),
                    help="where figures go")
+    p.add_argument("--abundances", nargs="*", default=None,
+                   help="abundance elements used as inputs when the run was "
+                        "trained. Pass empty (--abundances) for abundance-free "
+                        "runs (6 stellar params only). Default: the full "
+                        "ABUNDANCE_ELEMENTS set, matching legacy 27-input runs.")
     p.add_argument("--full-data", action="store_true",
                    help="load the whole 40 GB dataset instead of the test-only "
                         "cache (needed for runs whose split differs)")
@@ -453,9 +459,12 @@ def main():
                    help="half-width, in quantile units, of the band each "
                         "randomised panel is drawn from (default 0.02)")
     p.add_argument("--worst-pool", type=int, default=4,
-                   help="with --sample-seed, draw the 4 'worst' panels from "
+                   help="with --sample-seed, draw the 'worst' panels from "
                         "the top-N highest-RMSE spectra (default 4 = the "
                         "deterministic top 4)")
+    p.add_argument("--n-worst", type=int, default=4, dest="n_worst",
+                   help="number of highest-RMSE spectra to show in the worst-"
+                        "reconstruction figure (default 4)")
     args = p.parse_args()
 
     tags = args.tags or [d.parent.name if d.name.startswith("payne_") else d.name
@@ -469,7 +478,8 @@ def main():
     base = training.build_parser().parse_args([])
     base.model = "payne"
     base.labels = list(data_mod.CORE_LABELS)
-    base.abundances = list(data_mod.ABUNDANCE_ELEMENTS)
+    base.abundances = (list(data_mod.ABUNDANCE_ELEMENTS)
+                       if args.abundances is None else list(args.abundances))
     base.val_frac = 0.1
     base.test_frac = 0.1
     base.seed = 0
@@ -493,7 +503,7 @@ def main():
     for run_dir, tag in zip(args.run_dirs, tags):
         evaluate_run(run_dir, tag, ds, Xn, Yn, args.outdir, args.metrics_only,
                      rng=rng, band=args.quantile_band,
-                     worst_pool=args.worst_pool)
+                     worst_pool=args.worst_pool, n_worst=args.n_worst)
 
 
 if __name__ == "__main__":
