@@ -90,6 +90,11 @@ export BOSS_CACHE_DIR=/path/to/preprocessed_data     # dir holding the .h5 + sid
 # or BOSS_CACHE_PATH=/path/to/korg_grid_train.h5     # the file itself
 ```
 
+> **Data access.** The underlying BOSS spectra and the Korg synthesis grid are
+> **not public**. They are available to members of the SDSS collaboration
+> through the SDSS data access pages ([www.sdss.org](https://www.sdss.org)); a
+> valid SDSS collaboration login is required to download them.
+
 ---
 
 ## Repository layout
