@@ -16,6 +16,8 @@ dependencies = [
     "flax>=0.12.8",
     "optax>=0.2.8",
     "optuna>=4.9.0",
+    "numpyro>=0.21.0",
+    "optimistix>=0.1.0",
 ]
 
 [build-system]
