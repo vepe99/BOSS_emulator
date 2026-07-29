@@ -294,11 +294,15 @@ def plot_test_metrics(pred, true, metrics, outdir: Path, n_show: int = 6):
 
 
 def evaluate_test(predict_fn, payload, run_dir: Path, batch_size: int,
-                  n_plot: int, save_predictions: bool) -> dict:
+                  n_plot: int, save_predictions: bool,
+                  outdir: Path | None = None) -> dict:
     """Reconstruct the held-out test split, predict it, and report metrics.
 
     ``predict_fn(X) -> flux`` is the (possibly gated) prediction closure; the
     generalist ``payload`` supplies the ``data_config`` that defines the split.
+    ``outdir`` overrides where metrics/plots are written (default: the run dir);
+    pass a dedicated folder to keep gated-model artefacts separate from the
+    generalist's own.
     """
     cfg = payload.get("data_config")
     if cfg is None:
@@ -330,7 +334,9 @@ def evaluate_test(predict_fn, payload, run_dir: Path, batch_size: int,
     for k, v in summary.items():
         print(f"        {k:26s} {v}")
 
-    out = run_dir if run_dir.is_dir() else run_dir.parent
+    out = outdir if outdir is not None else (
+        run_dir if run_dir.is_dir() else run_dir.parent)
+    out.mkdir(parents=True, exist_ok=True)
     (out / "test_metrics.json").write_text(json.dumps(summary, indent=2))
     plot_test_metrics(Y_pred, Y_true, metrics, out, n_show=max(1, n_plot or 6))
     if save_predictions:
@@ -394,6 +400,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-predictions", action="store_true",
                    dest="save_predictions",
                    help="test mode: also write test_predictions.h5")
+    p.add_argument("--test-outdir", default=None, dest="test_outdir",
+                   help="test mode: write metrics/plots to this folder instead "
+                        "of the run dir (use to keep gated-model plots separate)")
     return p
 
 
@@ -426,7 +435,8 @@ def main() -> None:
 
     if args.test:
         evaluate_test(predict_fn, payload, Path(args.run), args.batch_size,
-                      args.plot, args.save_predictions)
+                      args.plot, args.save_predictions,
+                      outdir=Path(args.test_outdir) if args.test_outdir else None)
         return
 
     # Prediction mode.
