@@ -37,10 +37,10 @@ Four architectures live in [`src/boss_emulator/emulator.py`](src/boss_emulator/e
 
 | model | idea |
 |---|---|
-| **`PayneMLP`** | dense MLP, labels → all pixels (**the winner**) |
-| `DeepONet` | learned basis × label-dependent coefficients |
-| `SpectraFormer` | Perceiver-style cross-attention decoder |
-| `SpectraFormerSingleLambda` | coordinate/INR network, one pixel at a time |
+| **MLP** | dense network, labels → all pixels (**the winner**) |
+| DeepONet | learned basis × label-dependent coefficients |
+| SpectraFormer | Perceiver-style cross-attention decoder |
+| SpectraFormerSingleLambda | coordinate/INR network, one pixel at a time |
 
 For this data-rich, low-input-dimension regression the plain **MLP wins
 decisively** (~38× lower error than DeepONet); the fancier decoders impose
