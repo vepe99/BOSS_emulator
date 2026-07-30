@@ -97,9 +97,6 @@ ABUNDANCE_ELEMENTS = [e for e in CURATED_ELEMENTS if e not in FIXED_ELEMENTS]
 # array, so ``abundances[:, ABUNDANCE_COLS]`` selects them in cache order.
 ABUNDANCE_COLS = [ELEMENT_SYMBOLS_Z.index(e) for e in ABUNDANCE_ELEMENTS]
 
-# Backwards-compatible alias (the cached abundance columns, in cache order).
-VARYING_ELEMENTS = ABUNDANCE_ELEMENTS
-
 
 # =========================================================================
 # Cache construction

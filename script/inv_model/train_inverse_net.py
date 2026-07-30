@@ -7,7 +7,7 @@ the box centre -- which is what pulls the heavy-tailed stragglers out of wrong
 basins. It is NOT the final estimator (it has no notion of chi2 / the forward
 model); it only initialises the optimiser.
 
-Reuses the MLP (``build_model('payne', n_in=n_pixels, n_out=6)``) and the same
+Reuses the MLP (``build_model('mlp', n_in=n_pixels, n_out=6)``) and the same
 train/val split as everything else. Input is the standardised flux; output is
 the six core labels scaled to [0,1] by the training-split min/max. Saved as a
 pickle whose params load exactly like a forward checkpoint.
@@ -64,7 +64,7 @@ def main():
 
     training.claim_gpu()
     base = training.build_parser().parse_args([])
-    base.model = "payne"; base.labels = list(data_mod.CORE_LABELS)
+    base.model = "mlp"; base.labels = list(data_mod.CORE_LABELS)
     base.abundances = list(args.abundances); base.val_frac = 0.1
     base.test_frac = 0.1; base.seed = args.seed; base.max_rows = None
     ds, _, _ = training.prepare_data(base)
@@ -86,7 +86,7 @@ def main():
     Xin = ((ds.Y - xmean) / xstd).astype("float32")
 
     n_in, n_out = ds.n_pixels, len(core)
-    model = build_model("payne", n_in, n_out, seed=args.seed,
+    model = build_model("mlp", n_in, n_out, seed=args.seed,
                         hidden=tuple(args.hidden), activation=args.activation)
     model.train()
 
@@ -141,7 +141,7 @@ def main():
             _, pstate, _ = nnx.split(model, nnx.Param, ...)
             params = jax.tree.map(lambda x: np.asarray(x),
                                   nnx.to_pure_dict(pstate))
-            payload = {"kind": "inverse_net", "model": "payne",
+            payload = {"kind": "inverse_net", "model": "mlp",
                        "hidden": list(args.hidden), "activation": args.activation,
                        "n_features": n_in, "n_pixels": n_out, "seed": args.seed,
                        "core_labels": core, "lo": lo, "hi": hi,

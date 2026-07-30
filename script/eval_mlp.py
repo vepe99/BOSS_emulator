@@ -1,4 +1,4 @@
-"""Evaluation suite for trained Payne runs.
+"""Evaluation suite for trained MLP emulator runs.
 
 One entry point for every test-set diagnostic in this project. Point it at one
 or more run directories (each containing ``best.pkl`` and, ideally,
@@ -26,16 +26,14 @@ Each reconstruction panel carries a percentage-residual strip underneath it.
 Examples::
 
     # full suite for the best HPO trial
-    UV_CACHE_DIR=... uv run python script/eval_payne.py \
-        trained_model/payne_hpo/trial_0031/payne_* --tags trial31
+    BOSS_CACHE_DIR=/path/to/preprocessed_data .venv/bin/python \
+        script/eval_mlp.py <run_dir> --tags best
 
     # just the numbers, for a batch of runs
-    UV_CACHE_DIR=... uv run python script/eval_payne.py --metrics-only \
-        trained_model/payne_hpo/trial_00{16,25,31}/payne_*
+    .venv/bin/python script/eval_mlp.py --metrics-only <run_a> <run_b> <run_c>
 
     # different example spectra in the panels (same typicality, new draws)
-    UV_CACHE_DIR=... uv run python script/eval_payne.py --sample-seed 7 \
-        trained_model/payne_hpo/trial_0031/payne_* --tags trial31
+    .venv/bin/python script/eval_mlp.py --sample-seed 7 <run_dir> --tags best
 
 autocvd claims a free GPU before JAX initialises (lab policy).
 """
@@ -147,7 +145,7 @@ def _error_distribution(persp, metrics, tag, path):
     a2.set_xlabel("per-spectrum RMSE (log)")
     a2.set_ylabel("count (log)")
     a2.set_title("Error distribution (log-log, tail)")
-    fig.suptitle(f"Payne {tag}  n_test={persp.size:,}  "
+    fig.suptitle(f"MLP {tag}  n_test={persp.size:,}  "
                  f"median={metrics['per_spectrum_rmse_median']:.4f}  "
                  f"R2={metrics['r2']:.5f}", fontsize=12)
     fig.savefig(path, dpi=130, bbox_inches="tight")
@@ -189,7 +187,7 @@ def _teff_carbon_map(T, C, persp, tag, path):
         ax.set_title(f"{tag} test-set {ttl}")
         ax.axvline(4000, color="w", ls="--", lw=1.2)   # proposed retrain cut
         fig.colorbar(im, ax=ax, shrink=0.85)
-    fig.suptitle(f"Payne {tag}: reconstruction error over (Teff, carbon_m)",
+    fig.suptitle(f"MLP {tag}: reconstruction error over (Teff, carbon_m)",
                  fontsize=13)
     fig.savefig(path, dpi=125, bbox_inches="tight")
     plt.close(fig)
@@ -268,7 +266,7 @@ def _corner_error(labels, persp, tag, path):
                 ax.set_yticklabels([])
             ax.tick_params(labelsize=7)
 
-    fig.suptitle(f"Payne ({tag}) test-set RMSE in label space\n"
+    fig.suptitle(f"MLP ({tag}) test-set RMSE in label space\n"
                  "lower = median RMSE per bin | upper = max RMSE per bin | "
                  "diagonal = median (blue) & p99 (red) vs label", fontsize=12)
     fig.tight_layout(rect=[0, 0.01, 1, 0.97])
@@ -415,10 +413,10 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
               f"rmse={persp[loc]:.5f}", flush=True)
 
     _recon_panels(list(zip(names, picks)),
-                  f"Payne ({tag}) test-set reconstructions",
+                  f"MLP ({tag}) test-set reconstructions",
                   outdir / f"{tag}_sample_reconstructions.png", **kw)
     _recon_panels(worst,
-                  f"Payne ({tag}) worst test-set reconstructions",
+                  f"MLP ({tag}) worst test-set reconstructions",
                   outdir / f"{tag}_worst_reconstructions.png", **kw)
     _error_distribution(persp, metrics, tag,
                         outdir / f"{tag}_error_distribution.png")
@@ -438,7 +436,7 @@ def main():
                    help="figure-name prefix per run (default: run dir name)")
     p.add_argument("--metrics-only", action="store_true",
                    help="write reconstruction_stats_full.json only, no figures")
-    p.add_argument("--outdir", type=Path, default=Path("plots/payne_error_analysis"),
+    p.add_argument("--outdir", type=Path, default=Path("plots/mlp_error_analysis"),
                    help="where figures go")
     p.add_argument("--abundances", nargs="*", default=None,
                    help="abundance elements used as inputs when the run was "
@@ -467,8 +465,9 @@ def main():
                         "reconstruction figure (default 4)")
     args = p.parse_args()
 
-    tags = args.tags or [d.parent.name if d.name.startswith("payne_") else d.name
-                         for d in args.run_dirs]
+    tags = args.tags or [
+        d.parent.name if d.name.startswith(("mlp_", "payne_")) else d.name
+        for d in args.run_dirs]
     if len(tags) != len(args.run_dirs):
         p.error(f"--tags has {len(tags)} entries for {len(args.run_dirs)} runs")
 
@@ -476,7 +475,7 @@ def main():
 
     # Same data config as the HPO worker, so the split matches the trials.
     base = training.build_parser().parse_args([])
-    base.model = "payne"
+    base.model = "mlp"
     base.labels = list(data_mod.CORE_LABELS)
     base.abundances = (list(data_mod.ABUNDANCE_ELEMENTS)
                        if args.abundances is None else list(args.abundances))

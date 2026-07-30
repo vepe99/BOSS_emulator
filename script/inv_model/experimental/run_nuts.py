@@ -1,4 +1,9 @@
-"""Inverse modelling with HMC/NUTS (technique 3 of 3).
+"""Inverse modelling with HMC/NUTS -- EXPERIMENTAL, does not converge yet.
+
+Quarantined under ``experimental/``: on this posterior the chains freeze at
+their start (r_hat in the hundreds, ESS ~ 1). Kept as a starting point for
+future posterior work, not a working sampler. Needs ``numpyro`` (+ ``optimistix``
+for the gated forward map). Run from the project root so ``common`` imports.
 
 The first two techniques return a point estimate plus a *linearised* error bar.
 NUTS returns the posterior itself, which is what actually matters here: the
@@ -59,7 +64,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# common.py lives one directory up (this script is quarantined in experimental/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import matplotlib
@@ -275,7 +281,7 @@ def main() -> None:
                         "box, so a prior draw usually leaves the chains stuck "
                         "and is only useful as a deliberate stress test")
     p.add_argument("--map-steps", type=int, default=1000, dest="map_steps",
-                   help="Adam steps for --init-from-map")
+                   help="Adam steps for the MAP warm-start (--init map)")
     p.add_argument("--x64", action="store_true",
                    help="run the sampler in float64. The potential energy is "
                         "chi2/2 over 4479 pixels at 1/sigma^2 ~ 1e4, so its "

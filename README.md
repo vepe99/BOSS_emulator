@@ -31,20 +31,17 @@ function** of `(m_H, alpha_m, carbon_m)`, so they add no degrees of freedom —
 the emulator is trained **abundance-free on the six core labels** with no loss
 of accuracy, which also removes a nasty input degeneracy for inverse modelling.
 
-## Model zoo & the headline result
+## The model & the headline result
 
-Four architectures live in [`src/boss_emulator/emulator.py`](src/boss_emulator/emulator.py):
+The emulator is a plain **MLP** ([`src/boss_emulator/emulator.py`](src/boss_emulator/emulator.py)):
+a dense network mapping labels → all pixels in one shot, with optional residual
+connections and pre-activation LayerNorm.
 
-| model | idea |
-|---|---|
-| **MLP** | dense network, labels → all pixels (**the winner**) |
-| DeepONet | learned basis × label-dependent coefficients |
-| SpectraFormer | Perceiver-style cross-attention decoder |
-| SpectraFormerSingleLambda | coordinate/INR network, one pixel at a time |
-
-For this data-rich, low-input-dimension regression the plain **MLP wins
-decisively** (~38× lower error than DeepONet); the fancier decoders impose
-inductive biases that only bottleneck capacity here.
+Three fancier architectures were evaluated and dropped — a DeepONet (learned
+basis × coefficients), a Perceiver-style cross-attention decoder, and a
+coordinate/INR network. For this data-rich, low-input-dimension regression the
+plain MLP won **decisively** (~38× lower error than the DeepONet): the fancier
+decoders impose inductive biases that only bottleneck capacity here.
 
 After an Optuna hyper-parameter search the best model is an **8×1281 SiLU MLP**:
 
@@ -102,12 +99,12 @@ export BOSS_CACHE_DIR=/path/to/preprocessed_data     # dir holding the .h5 + sid
 ```
 src/boss_emulator/
   data.py          grid → cached, standardised, split dataset (+ test-only fast path)
-  emulator.py      PayneMLP / DeepONet / SpectraFormer / build_model / load_checkpoint
+  emulator.py      MLP / build_model / load_checkpoint / predict_spectra
   training.py      device-resident training loop, AdamW warmup-cosine, checkpointing, CLI
   predict.py       forward inference; optional generalist+specialist Teff gate
 script/
-  tune_payne.py, tune_deeponet.py   Optuna hyper-parameter search (multi-worker)
-  eval_payne.py                     full test-set evaluation suite (metrics + figures)
+  tune_mlp.py                       Optuna hyper-parameter search (multi-worker)
+  eval_mlp.py                       full test-set evaluation suite (metrics + figures)
   exp_specialist_gate.py            train the cool-star specialist for the gate
   exp_target_transform.py           (experiment) target reparameterisation — negative result
   inv_model/                        inverse modelling: labels from spectra (own README)
@@ -122,10 +119,10 @@ Trained models land in `trained_model/`, figures in `plots/` — both git-ignore
 ### Train
 
 ```bash
-python -m boss_emulator.training --model payne \
+python -m boss_emulator.training --model mlp \
     --labels Teff logg m_H alpha_m carbon_m vmic \
     --hidden 1281 1281 1281 1281 1281 1281 1281 1281 --activation silu \
-    --epochs 1000 --batch-size 4096 --outdir trained_model/payne
+    --epochs 1000 --batch-size 4096 --outdir trained_model/mlp
 ```
 
 Abundance-free is the default (`--abundances` empty); add elements to train the
@@ -136,8 +133,8 @@ bound, not host-bound.
 
 ```bash
 BOSS_CACHE_DIR=/path/to/preprocessed_data \
-    python script/tune_payne.py --study-name payne_hpo --n-trials 100 \
-    --epochs 1000 --abundances --outdir trained_model/payne_hpo
+    python script/tune_mlp.py --study-name mlp_hpo --n-trials 100 \
+    --epochs 1000 --outdir trained_model/mlp_hpo
 ```
 
 A shared `JournalStorage` file lets several workers (one per GPU) cooperate on
@@ -147,8 +144,7 @@ one study; the objective is per-spectrum median reconstruction RMSE with
 ### Evaluate
 
 ```bash
-python script/eval_payne.py trained_model/payne_hpo/trial_XXXX/payne_* \
-    --abundances --n-worst 10 --outdir plots/payne_eval
+python script/eval_mlp.py <run_dir> --n-worst 10 --outdir plots/mlp_eval
 ```
 
 Writes R²/RMSE/SNR metrics plus error-distribution, sample/worst

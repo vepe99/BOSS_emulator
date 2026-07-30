@@ -119,7 +119,7 @@ def main():
 
     # --- Data: full split, same config/standardisation as the generalist -----
     base = training.build_parser().parse_args([])
-    base.model = "payne"; base.labels = list(data_mod.CORE_LABELS)
+    base.model = "mlp"; base.labels = list(data_mod.CORE_LABELS)
     base.abundances = []; base.val_frac = 0.1; base.test_frac = 0.1
     base.seed = 0; base.max_rows = None
     ds, Xn, Yn = training.prepare_data(base)

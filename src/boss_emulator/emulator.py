@@ -1,30 +1,12 @@
-"""Neural spectral emulators built with Flax NNX.
+"""Neural spectral emulator built with Flax NNX.
 
-Three architectures map stellar labels to a normalised spectrum of
-``n_pixels`` fluxes:
+:class:`MLP` maps stellar labels to a normalised spectrum of ``n_pixels``
+fluxes in one shot (labels -> R^{n_pixels}). It is a plain multilayer
+perceptron with optional residual connections and pre-activation LayerNorm.
 
-* :class:`PayneMLP` -- a Payne-style multilayer perceptron that emits the
-  whole spectrum vector in one shot (labels -> R^{n_pixels}).
-
-* :class:`DeepONet` -- an operator-learning network. A *branch* net encodes
-  the labels into ``latent`` coefficients; a *trunk* net encodes each pixel
-  coordinate into ``latent`` basis values. The predicted flux at a pixel is
-  the inner product of the two (plus a bias), i.e. the spectrum is expanded
-  in a learned, coordinate-dependent basis. This decouples "which star"
-  (branch) from "where on the spectrum" (trunk) and can generalise across
-  the pixel grid.
-
-* :class:`SpectraFormer` -- a Perceiver-style cross-attention decoder. Each
-  scalar label becomes a memory token (the keys/values); each pixel owns a
-  learned query embedding. Stacked multi-head cross-attention blocks (with
-  residual connections + pre-LayerNorm) let every pixel query the label
-  memory, and a linear head reads out the flux. Pixels attend only to the
-  labels, never to each other, so the whole spectrum is produced in a single
-  forward pass and the pixels stay mutually independent -- a learned,
-  attention-weighted generalisation of the DeepONet factorisation.
-
-All take standardised inputs and return standardised outputs; the
-de-standardisation lives with the :class:`~boss_emulator.data.Dataset`.
+The model takes standardised inputs and returns standardised outputs; the
+de-standardisation lives with the :class:`~boss_emulator.data.Dataset`
+(see :func:`predict_spectra` for the ready-made forward recipe).
 """
 
 from __future__ import annotations
@@ -33,6 +15,7 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 Activation = Callable[[jax.Array], jax.Array]
@@ -73,8 +56,8 @@ def _mlp_layers(
     ]
 
 
-class PayneMLP(nnx.Module):
-    """Payne-style MLP: labels -> full spectrum.
+class MLP(nnx.Module):
+    """Multilayer perceptron: labels -> full spectrum.
 
     Parameters
     ----------
@@ -140,208 +123,9 @@ class PayneMLP(nnx.Module):
         return self.layers[-1](x)  # linear output head
 
 
-class DeepONet(nnx.Module):
-    """DeepONet mapping labels -> spectrum over a fixed pixel grid.
-
-    The trunk consumes normalised pixel coordinates in [-1, 1]; these are
-    fixed for the grid and cached at construction. ``forward`` therefore
-    only needs the labels.
-
-    Parameters
-    ----------
-    n_features : int
-        Number of input labels (branch input dimension).
-    n_pixels : int
-        Number of pixels (trunk is evaluated at each).
-    latent : int
-        Shared latent dimension p of branch/trunk (number of basis funcs).
-    branch_hidden, trunk_hidden : sequence of int
-        Hidden widths of the two sub-networks.
-    activation : callable
-        Nonlinearity (default GELU).
-    dropout : float
-        Dropout rate applied to each *branch* hidden activation (the
-        label-dependent encoder). The trunk sees only fixed pixel
-        coordinates and is left clean. 0.0 disables it (no Dropout module
-        created). Active only in training mode; ``model.eval()`` for
-        deterministic inference.
-    """
-
-    def __init__(
-        self,
-        n_features: int,
-        n_pixels: int,
-        latent: int = 256,
-        branch_hidden: Sequence[int] = (512, 512),
-        trunk_hidden: Sequence[int] = (256, 256, 256),
-        activation: Activation = nnx.gelu,
-        dropout: float = 0.0,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.branch = nnx.data(_mlp_layers(rngs, n_features, branch_hidden, latent))
-        self.trunk = nnx.data(_mlp_layers(rngs, 1, trunk_hidden, latent))
-        self.bias = nnx.Param(jnp.zeros((n_pixels,)))
-        self.activation = activation
-        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
-        self.latent = latent
-        self.n_features = n_features
-        self.n_pixels = n_pixels
-
-        # Fixed, normalised pixel coordinates in [-1, 1], shape (n_pixels, 1).
-        coords = jnp.linspace(-1.0, 1.0, n_pixels).reshape(-1, 1)
-        self.coords = nnx.Variable(coords)
-
-    def _branch(self, x: jax.Array) -> jax.Array:
-        for layer in self.branch[:-1]:
-            x = self.activation(layer(x))
-            if self.dropout is not None:
-                x = self.dropout(x)
-        return self.branch[-1](x)  # (batch, latent)
-
-    def _trunk(self, c: jax.Array) -> jax.Array:
-        for layer in self.trunk[:-1]:
-            c = self.activation(layer(c))
-        return self.activation(self.trunk[-1](c))  # (n_pixels, latent)
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        b = self._branch(x)                 # (batch, latent)
-        t = self._trunk(self.coords.value)  # (n_pixels, latent)
-        # flux[b, pix] = sum_k branch[b, k] * trunk[pix, k] + bias[pix]
-        out = b @ t.T                        # (batch, n_pixels)
-        return out + self.bias.value
-
-
-class _CrossAttnBlock(nnx.Module):
-    """One pre-LayerNorm cross-attention + feed-forward block.
-
-    Queries (one per pixel) attend to a fixed label memory (K/V). Both the
-    attention and the FFN are wrapped in residual connections; LayerNorm is
-    applied to the *inputs* of each sub-layer (pre-LN), which trains more
-    stably than post-LN for deep stacks. The label memory is not updated
-    here -- only the queries are -- so pixels never attend to one another.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        mlp_dim: int,
-        activation: Activation,
-        dropout: float,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.ln_q = nnx.LayerNorm(d_model, rngs=rngs)
-        self.ln_kv = nnx.LayerNorm(d_model, rngs=rngs)
-        self.attn = nnx.MultiHeadAttention(
-            num_heads=n_heads, in_features=d_model,
-            dropout_rate=dropout, decode=False, rngs=rngs)
-        self.ln_ff = nnx.LayerNorm(d_model, rngs=rngs)
-        self.fc1 = nnx.Linear(d_model, mlp_dim, rngs=rngs)
-        self.fc2 = nnx.Linear(mlp_dim, d_model, rngs=rngs)
-        self.activation = activation
-        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
-
-    def _drop(self, x: jax.Array) -> jax.Array:
-        return self.dropout(x) if self.dropout is not None else x
-
-    def __call__(self, q: jax.Array, kv: jax.Array) -> jax.Array:
-        # Cross-attention sub-layer (queries attend to the label memory).
-        qn = self.ln_q(q)
-        kvn = self.ln_kv(kv)
-        q = q + self.attn(qn, kvn, kvn)
-        # Position-wise feed-forward sub-layer.
-        h = self._drop(self.activation(self.fc1(self.ln_ff(q))))
-        q = q + self._drop(self.fc2(h))
-        return q
-
-
-class SpectraFormer(nnx.Module):
-    """Cross-attention decoder: labels -> spectrum, one shot.
-
-    The ``n_features`` scalar labels are projected to ``d_model`` and given a
-    learned per-label embedding, forming a small memory of key/value tokens.
-    Each of the ``n_pixels`` output pixels owns a learned query embedding.
-    ``n_blocks`` multi-head cross-attention blocks let the pixel queries read
-    from the label memory (residual + pre-LayerNorm throughout), and a linear
-    head maps each refined query to its scalar flux.
-
-    Because pixels attend only to the labels (never to each other), the model
-    is permutation-equivariant over pixels and emits the full spectrum in a
-    single pass -- an attention-weighted generalisation of DeepONet.
-
-    Parameters
-    ----------
-    n_features : int
-        Number of input labels (number of memory tokens).
-    n_pixels : int
-        Length of the output spectrum (number of query tokens).
-    d_model : int
-        Token/embedding width shared by queries and memory.
-    n_heads : int
-        Number of attention heads (must divide ``d_model``).
-    n_blocks : int
-        Number of stacked cross-attention blocks.
-    mlp_dim : int
-        Hidden width of each block's feed-forward network.
-    activation : callable
-        Feed-forward nonlinearity (default GELU).
-    dropout : float
-        Dropout rate applied inside attention and the feed-forward networks.
-        0.0 disables it (no Dropout modules created). Active only in training
-        mode; call ``model.eval()`` for deterministic inference.
-
-    Notes
-    -----
-    Activations scale as ``batch * n_pixels * d_model`` (and ``* mlp_dim`` in
-    the FFN), which for the full 4479-pixel grid is the memory bottleneck.
-    Use a smaller ``--batch-size`` (e.g. 256) than the MLP/DeepONet default.
-    """
-
-    def __init__(
-        self,
-        n_features: int,
-        n_pixels: int,
-        d_model: int = 256,
-        n_heads: int = 8,
-        n_blocks: int = 4,
-        mlp_dim: int = 512,
-        activation: Activation = nnx.gelu,
-        dropout: float = 0.0,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
-        self.value_proj = nnx.Linear(1, d_model, rngs=rngs)   # scalar -> token
-        self.label_embed = nnx.Embed(n_features, d_model, rngs=rngs)
-        self.query_embed = nnx.Embed(n_pixels, d_model, rngs=rngs)
-        self.blocks = nnx.data([
-            _CrossAttnBlock(d_model, n_heads, mlp_dim, activation, dropout,
-                            rngs=rngs)
-            for _ in range(n_blocks)
-        ])
-        self.ln_out = nnx.LayerNorm(d_model, rngs=rngs)
-        self.head = nnx.Linear(d_model, 1, rngs=rngs)
-        self.d_model = d_model
-        self.n_features = n_features
-        self.n_pixels = n_pixels
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        b = x.shape[0]
-        # Label memory (keys/values): value token + learned label identity.
-        values = self.value_proj(x[..., None])                # (b, n_feat, d)
-        labels = self.label_embed(jnp.arange(self.n_features))  # (n_feat, d)
-        kv = values + labels[None]                            # (b, n_feat, d)
-        # Pixel queries, shared across the batch then refined per sample.
-        q = self.query_embed(jnp.arange(self.n_pixels))        # (n_pix, d)
-        q = jnp.broadcast_to(q, (b, self.n_pixels, self.d_model))
-        for block in self.blocks:
-            q = block(q, kv)
-        out = self.head(self.ln_out(q))                       # (b, n_pix, 1)
-        return out[..., 0]                                    # (b, n_pix)
+# Canonical model name, plus a back-compat alias: checkpoints trained before
+# the rename recorded model="payne"; both mean the MLP.
+_MLP_NAMES = ("mlp", "payne")
 
 
 def build_model(
@@ -353,28 +137,13 @@ def build_model(
 ) -> nnx.Module:
     """Factory: construct a model by name.
 
-    Known names: ``'payne'``, ``'deeponet'``, ``'transformer'`` and
-    ``'singlelambda'`` (the coordinate-query cross-attention emulator, whose
-    forward is ``model(x, coords)`` rather than ``model(x)``).
+    Only the MLP is supported (name ``'mlp'``; the legacy alias ``'payne'`` is
+    accepted so older checkpoints still load).
     """
     rngs = nnx.Rngs(seed)
-    name = name.lower()
-    if name == "payne":
-        return PayneMLP(n_features, n_pixels, rngs=rngs, **kwargs)
-    if name == "deeponet":
-        return DeepONet(n_features, n_pixels, rngs=rngs, **kwargs)
-    if name == "transformer":
-        return SpectraFormer(n_features, n_pixels, rngs=rngs, **kwargs)
-    if name == "singlelambda":
-        # Deferred import: the submodule imports _CrossAttnBlock from this
-        # module at its top level, so importing it here avoids a cycle.
-        from boss_emulator.singlelambda.emulator_singlelambda import (
-            SpectraFormerSingleLambda)
-        return SpectraFormerSingleLambda(
-            n_features, n_pixels, rngs=rngs, **kwargs)
-    raise ValueError(
-        f"unknown model {name!r}; choose 'payne', 'deeponet', "
-        f"'transformer' or 'singlelambda'")
+    if name.lower() in _MLP_NAMES:
+        return MLP(n_features, n_pixels, rngs=rngs, **kwargs)
+    raise ValueError(f"unknown model {name!r}; only 'mlp' is supported")
 
 
 def load_checkpoint(path):
@@ -382,35 +151,47 @@ def load_checkpoint(path):
 
     Returns ``(model, payload)`` where ``payload`` is the dict written by
     ``training.save_checkpoint`` (holding x/y mean/std, feature_names, ...).
-    Predict de-normalised flux for raw labels ``X`` (shape (n, n_features))
-    with::
-
-        xn = (X - payload['x_mean']) / payload['x_std']
-        yn = model(jnp.asarray(xn))
-        flux = yn * payload['y_std'] + payload['y_mean']
+    Use :func:`predict_spectra` to turn raw labels into de-normalised flux.
     """
     import pickle
 
     with open(path, "rb") as f:
         payload = pickle.load(f)
 
-    hidden = payload.get("hidden")
     kwargs = dict(payload.get("model_kwargs") or {})
     dropout = payload.get("dropout", 0.0)
     if dropout:
         kwargs["dropout"] = dropout
+    hidden = payload.get("hidden")
     if hidden:
-        if payload["model"] == "payne":
-            kwargs["hidden"] = tuple(hidden)
-        else:
-            kwargs["branch_hidden"] = tuple(hidden)
+        kwargs["hidden"] = tuple(hidden)
     model = build_model(
         payload["model"], payload["n_features"], payload["n_pixels"],
         seed=payload.get("seed", 0), **kwargs)
     # Restore only the learnable Param state (what save_checkpoint persists);
-    # non-Param state (rng streams, coords) is already correct from build.
+    # non-Param state (rng streams) is already correct from build.
     graphdef, param_state, rest = nnx.split(model, nnx.Param, ...)
     nnx.replace_by_pure_dict(param_state, payload["params"])
     model = nnx.merge(graphdef, param_state, rest)
     model.eval()  # deterministic inference (no-op when there is no dropout)
     return model, payload
+
+
+def predict_spectra(model, payload, X, batch_size: int = 4096) -> np.ndarray:
+    """De-normalised spectra for raw labels ``X`` (shape ``(n, n_features)``).
+
+    Applies the checkpoint's input/output standardisation around the model:
+    ``flux = model((X - x_mean)/x_std) * y_std + y_mean``. Batched so large
+    label sets fit in memory. This is the one place the forward recipe lives;
+    ``predict.py`` builds on it.
+    """
+    x_mean, x_std = payload["x_mean"], payload["x_std"]
+    y_mean, y_std = payload["y_mean"], payload["y_std"]
+    X = np.asarray(X, dtype="float32")
+    out = np.empty((X.shape[0], payload["n_pixels"]), dtype="float32")
+    for start in range(0, X.shape[0], batch_size):
+        stop = min(start + batch_size, X.shape[0])
+        xn = (X[start:stop] - x_mean) / x_std
+        yn = np.asarray(model(jnp.asarray(xn)))
+        out[start:stop] = yn * y_std + y_mean
+    return out

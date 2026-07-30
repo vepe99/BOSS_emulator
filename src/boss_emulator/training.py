@@ -2,9 +2,8 @@
 
 Usage (from the project root)::
 
-    uv run python -m boss_emulator.training --model payne --epochs 50
-    uv run python -m boss_emulator.training --model deeponet \
-        --labels Teff logg m_H alpha_m carbon_m vmic --abundances Fe C
+    .venv/bin/python -m boss_emulator.training --model mlp --epochs 1000 \
+        --hidden 2048 2048 2048 2048 --activation silu
 
 On first run the ~40 GB float32 cache is built under ``preprocessed_data/``;
 subsequent runs just load it. A free GPU is selected automatically with
@@ -13,21 +12,10 @@ subsequent runs just load it. A free GPU is selected automatically with
 
 from __future__ import annotations
 
-# --- GPU selection MUST happen before importing jax ----------------------
-# autocvd picks a free GPU and sets CUDA_VISIBLE_DEVICES (lab policy). It is
-# skipped when the device is already chosen (CUDA_VISIBLE_DEVICES set), when
-# CPU is forced (JAX_PLATFORMS=cpu), or when BOSS_NO_AUTOCVD is set -- so the
-# module can be imported for CPU tests without blocking on a free GPU.
-import os
+# GPU selection MUST happen before importing jax (lab policy). See _gpu.py.
+from boss_emulator._gpu import claim_free_gpu
 
-if not (
-    os.environ.get("BOSS_NO_AUTOCVD")
-    or os.environ.get("CUDA_VISIBLE_DEVICES")
-    or os.environ.get("JAX_PLATFORMS", "").lower() == "cpu"
-):
-    from autocvd import autocvd
-
-    autocvd(num_gpus=1)
+claim_free_gpu()
 
 import argparse
 import json
@@ -80,12 +68,6 @@ def train_step(model, optimizer, x, y):
     loss, grads = nnx.value_and_grad(loss_fn)(model)
     optimizer.update(model, grads)
     return loss
-
-
-@nnx.jit
-def eval_step(model, x, y):
-    pred = model(x)
-    return jnp.mean((pred - y) ** 2)
 
 
 @nnx.jit
@@ -297,23 +279,13 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
     val_pos = np.arange(ds.val_idx.size)
 
     # 4. Model + optimizer (Adam with cosine decay).
-    model_kwargs = {}
+    model_kwargs = {
+        "activation": args.activation,
+        "residual": args.residual,
+        "layernorm": args.layernorm,
+    }
     if args.hidden:
-        if args.model == "payne":
-            model_kwargs["hidden"] = tuple(args.hidden)
-        else:
-            model_kwargs["branch_hidden"] = tuple(args.hidden)
-    if args.model == "payne":
-        model_kwargs["activation"] = args.activation
-        model_kwargs["residual"] = args.residual
-        model_kwargs["layernorm"] = args.layernorm
-    if args.model == "deeponet":
-        model_kwargs["latent"] = args.latent
-    if args.model == "transformer":
-        model_kwargs["d_model"] = args.d_model
-        model_kwargs["n_heads"] = args.n_heads
-        model_kwargs["n_blocks"] = args.n_blocks
-        model_kwargs["mlp_dim"] = args.mlp_dim
+        model_kwargs["hidden"] = tuple(args.hidden)
     if args.dropout:
         model_kwargs["dropout"] = args.dropout
     model = build_model(
@@ -436,35 +408,16 @@ def plot_loss(history: list[dict], path: Path) -> None:
 
 
 def _persisted_model_kwargs(args) -> dict:
-    """Model-specific constructor kwargs to store in the checkpoint.
+    """Model constructor kwargs to store in the checkpoint.
 
     Excludes ``dropout`` and ``hidden``, which ``load_checkpoint`` restores
     from their own dedicated payload fields.
     """
-    if args.model == "payne":
-        return {
-            "activation": args.activation,
-            "residual": args.residual,
-            "layernorm": args.layernorm,
-        }
-    if args.model == "deeponet":
-        return {"latent": args.latent}
-    if args.model == "transformer":
-        return {
-            "d_model": args.d_model,
-            "n_heads": args.n_heads,
-            "n_blocks": args.n_blocks,
-            "mlp_dim": args.mlp_dim,
-        }
-    if args.model == "singlelambda":
-        return {
-            "d_model": args.d_model,
-            "n_heads": args.n_heads,
-            "n_blocks": args.n_blocks,
-            "mlp_dim": args.mlp_dim,
-            "n_fourier": args.n_fourier,
-        }
-    return {}
+    return {
+        "activation": args.activation,
+        "residual": args.residual,
+        "layernorm": args.layernorm,
+    }
 
 
 def save_checkpoint(path: Path, model, ds, args) -> None:
@@ -475,9 +428,8 @@ def save_checkpoint(path: Path, model, ds, args) -> None:
     de-normalise predictions. Reload with :func:`load_checkpoint`.
     """
     # Persist only the learnable Param state. Non-Param state (dropout RNG
-    # streams -- typed PRNG keys that np.asarray can't convert -- and the
-    # DeepONet fixed pixel coords) is reconstructed deterministically at
-    # build time, so it need not be pickled.
+    # streams -- typed PRNG keys that np.asarray can't convert) is
+    # reconstructed deterministically at build time, so it need not be pickled.
     _, param_state, _ = nnx.split(model, nnx.Param, ...)
     params = jax.tree.map(lambda x: np.asarray(x), nnx.to_pure_dict(param_state))
     payload = {
@@ -515,8 +467,8 @@ def save_checkpoint(path: Path, model, ds, args) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train a BOSS spectral emulator.")
-    p.add_argument("--model", choices=["payne", "deeponet", "transformer"],
-                   default="payne")
+    p.add_argument("--model", choices=["mlp"], default="mlp",
+                   help="model architecture (only the MLP is supported)")
     p.add_argument("--labels", nargs="+", default=list(CORE_LABELS),
                    metavar="LABEL",
                    help=f"core labels to use (subset of {CORE_LABELS})")
@@ -530,29 +482,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-4,
                    dest="weight_decay", help="AdamW weight decay")
     p.add_argument("--hidden", type=int, nargs="*", default=None,
-                   help="hidden layer widths (payne: whole net; "
-                        "deeponet: branch net)")
-    p.add_argument("--latent", type=int, default=256,
-                   help="DeepONet latent/basis dimension")
-    p.add_argument("--d-model", type=int, default=256, dest="d_model",
-                   help="transformer token/embedding width")
-    p.add_argument("--n-heads", type=int, default=8, dest="n_heads",
-                   help="transformer number of attention heads")
-    p.add_argument("--n-blocks", type=int, default=4, dest="n_blocks",
-                   help="transformer number of cross-attention blocks")
-    p.add_argument("--mlp-dim", type=int, default=512, dest="mlp_dim",
-                   help="transformer feed-forward hidden width")
+                   help="hidden layer widths, e.g. --hidden 2048 2048 2048")
     p.add_argument("--dropout", type=float, default=0.0,
-                   help="dropout rate on hidden activations (payne: whole "
-                        "net; deeponet: branch net). 0.0 disables it")
+                   help="dropout rate on hidden activations (0.0 disables it)")
     p.add_argument("--activation", default="gelu",
                    choices=["gelu", "silu", "relu", "tanh"],
-                   help="payne hidden-layer activation")
+                   help="hidden-layer activation")
     p.add_argument("--residual", action="store_true",
-                   help="payne: residual/skip connections between "
-                        "equal-width hidden layers")
+                   help="residual/skip connections between equal-width "
+                        "hidden layers")
     p.add_argument("--layernorm", action="store_true",
-                   help="payne: pre-activation LayerNorm on hidden layers")
+                   help="pre-activation LayerNorm on hidden layers")
     p.add_argument("--ckpt-every", type=int, default=0, dest="ckpt_every",
                    help="also snapshot the model every N epochs "
                         "(0 = only best.pkl/final.pkl)")

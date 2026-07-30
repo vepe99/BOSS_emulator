@@ -21,13 +21,11 @@ the generalist predicts, and stays continuous in parameter space.
 Usage (from the project root)::
 
     # predict for a user-supplied set of labels
-    uv run python -m boss_emulator.predict \
-        --run trained_model/payne_1700000000 --inputs my_labels.npy \
-        --output predictions.h5 --plot 8
+    .venv/bin/python -m boss_emulator.predict \
+        --run <run_dir> --inputs my_labels.csv --output predictions.h5 --plot 8
 
     # evaluate reconstruction metrics on the held-out test set
-    uv run python -m boss_emulator.predict \
-        --run trained_model/payne_1700000000 --test
+    .venv/bin/python -m boss_emulator.predict --run <run_dir> --test
 
 Supported ``--inputs`` formats
 ------------------------------
@@ -41,28 +39,20 @@ Supported ``--inputs`` formats
 
 from __future__ import annotations
 
-# --- GPU selection MUST happen before importing jax (see training.py) ----
-import os
+# GPU selection MUST happen before importing jax (lab policy). See _gpu.py.
+from boss_emulator._gpu import claim_free_gpu
 
-if not (
-    os.environ.get("BOSS_NO_AUTOCVD")
-    or os.environ.get("CUDA_VISIBLE_DEVICES")
-    or os.environ.get("JAX_PLATFORMS", "").lower() == "cpu"
-):
-    from autocvd import autocvd
-
-    autocvd(num_gpus=1)
+claim_free_gpu()
 
 import argparse
 import json
 from pathlib import Path
 
 import h5py
-import jax.numpy as jnp
 import numpy as np
 
 from boss_emulator import data as data_mod
-from boss_emulator.emulator import load_checkpoint
+from boss_emulator.emulator import load_checkpoint, predict_spectra
 
 
 def resolve_checkpoint(run: str, which: str) -> Path:
@@ -127,16 +117,12 @@ def load_inputs(path: Path, feature_names: list[str]) -> np.ndarray:
 
 
 def predict(model, payload, X: np.ndarray, batch_size: int = 4096) -> np.ndarray:
-    """Predict de-normalised spectra for raw label array ``X``."""
-    x_mean, x_std = payload["x_mean"], payload["x_std"]
-    y_mean, y_std = payload["y_mean"], payload["y_std"]
-    out = np.empty((X.shape[0], payload["n_pixels"]), dtype="float32")
-    for start in range(0, X.shape[0], batch_size):
-        stop = min(start + batch_size, X.shape[0])
-        xn = (X[start:stop] - x_mean) / x_std
-        yn = np.asarray(model(jnp.asarray(xn)))
-        out[start:stop] = yn * y_std + y_mean
-    return out
+    """Predict de-normalised spectra for raw label array ``X``.
+
+    Thin wrapper over :func:`boss_emulator.emulator.predict_spectra` (the single
+    forward recipe: standardise inputs -> model -> de-standardise outputs).
+    """
+    return predict_spectra(model, payload, X, batch_size=batch_size)
 
 
 def gate_weight(teff: np.ndarray, lo: float, hi: float) -> np.ndarray:

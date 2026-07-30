@@ -2,7 +2,7 @@
 
 Motivation
 ----------
-The winning Payne emulator's error is not spread evenly -- it concentrates in
+The winning MLP emulator's error is not spread evenly -- it concentrates in
 cool stars (Teff <~ 4000 K), whose deep TiO/CO molecular bands drive the
 continuum-normalised flux toward zero. The training target is **per-pixel
 standardised**: each pixel's residual is divided by that pixel's across-star
@@ -209,7 +209,7 @@ def main():
 
     # Fixed architecture = best categorical-width HPO trial (#52), abundance-free.
     base = training.build_parser().parse_args([])
-    base.model = "payne"
+    base.model = "mlp"
     base.labels = list(data_mod.CORE_LABELS)
     base.abundances = []                      # 6 stellar params only
     base.val_frac = 0.1
