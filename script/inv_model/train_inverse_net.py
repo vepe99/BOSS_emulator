@@ -54,6 +54,10 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-5, dest="weight_decay")
     p.add_argument("--abundances", nargs="*", default=[])
+    p.add_argument("--snr", type=float, default=None,
+                   help="noise-augment training: add fresh N(0, 1/snr) flux "
+                        "noise to each input batch so the net inverts noisy "
+                        "spectra (also evaluated at this SNR). Omit for clean.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="trained_model/inverse_net/inv.pkl")
     args = p.parse_args()
@@ -90,6 +94,20 @@ def main():
     Xva = jax.device_put(Xin[ds.val_idx]);   Yva = jax.device_put(S[ds.val_idx])
     tr_pos = np.arange(ds.train_idx.size)
 
+    # Noise augmentation. sigma = 1/snr is in physical flux; in the (floored-
+    # std) standardised input space it becomes sigma/xstd per pixel. Fresh
+    # noise is drawn per batch during training; the validation set gets one
+    # fixed noisy realisation so the best-checkpoint objective is stable.
+    noise_scale = key = None
+    Xva_eval = Xva
+    if args.snr:
+        noise_scale = jnp.asarray((1.0 / args.snr) / xstd, jnp.float32)
+        key = jax.random.PRNGKey(args.seed)
+        kv, key = jax.random.split(key)
+        Xva_eval = Xva + jax.random.normal(kv, Xva.shape) * noise_scale
+        print(f"[invnet] noise-augmenting training at SNR={args.snr:g} "
+              f"(sigma={1.0/args.snr:.3g} flux)", flush=True)
+
     steps = max(1, ds.train_idx.size // args.batch_size)
     total = steps * args.epochs
     sched = optax.warmup_cosine_decay_schedule(
@@ -105,11 +123,15 @@ def main():
     for epoch in range(args.epochs):
         t0 = time.time()
         for b in data_mod.iter_batches(tr_pos, args.batch_size, seed=epoch):
-            _step(model, opt, Xtr[b], Ytr[b])
+            xb = Xtr[b]
+            if noise_scale is not None:
+                key, sub = jax.random.split(key)
+                xb = xb + jax.random.normal(sub, xb.shape) * noise_scale
+            _step(model, opt, xb, Ytr[b])
         model.eval()
         # validation: select on the unitless mean scaled MAE (comparable across
         # labels); print per-label PHYSICAL MAE for readability.
-        pv = np.asarray(model(Xva)); yv = np.asarray(Yva)
+        pv = np.asarray(model(Xva_eval)); yv = np.asarray(Yva)
         mae_scaled = np.mean(np.abs(pv - yv), 0)           # per-label, [0,1] units
         mae_phys = mae_scaled * np.asarray(span)           # per-label, physical
         model.train()
@@ -123,7 +145,8 @@ def main():
                        "hidden": list(args.hidden), "activation": args.activation,
                        "n_features": n_in, "n_pixels": n_out, "seed": args.seed,
                        "core_labels": core, "lo": lo, "hi": hi,
-                       "y_mean": xmean, "y_std": xstd, "params": params}
+                       "y_mean": xmean, "y_std": xstd, "params": params,
+                       "train_snr": args.snr}
             with open(out, "wb") as f:
                 pickle.dump(payload, f)
         if epoch % 20 == 0 or epoch == args.epochs - 1:
