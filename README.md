@@ -51,6 +51,11 @@ After an Optuna hyper-parameter search the best model is an **8×1281 SiLU MLP**
 | per-spectrum median RMSE | 7.2 × 10⁻⁴ (norm. flux) |
 | standardised RMSE | 6.6 × 10⁻³ |
 
+Emulated vs. Korg spectra spanning the error range (best → p90), with the
+percentage residual under each panel:
+
+![Forward reconstructions](docs/forward_reconstructions.png)
+
 ### Cool-star specialist + gate
 
 Residual error concentrates in cool, carbon-rich, high-microturbulence stars
@@ -66,21 +71,21 @@ a model limitation — they would only shrink with denser Korg sampling there.
 
 ## Install
 
-The lab GPU policy is honoured automatically: importing the training/predict
-modules calls `autocvd` to claim a free GPU before JAX initialises.
+Requires Python ≥ 3.11 and [JAX](https://docs.jax.dev/en/latest/installation.html)
+(install the CUDA build for GPU, the CPU build otherwise).
 
 ```bash
-# option A: uv (recommended if available)
-uv sync
-
-# option B: plain venv + pip
-python3 -m venv .venv
-.venv/bin/pip install -e .
+pip install -e .          # or: uv sync
 ```
 
-The preprocessed cache (`korg_grid_train.h5`, ~40 GB) is built on first use
-from the raw Korg grid (the `data/` symlink). Point at a shared prebuilt cache
-without copying it via an environment variable:
+**GPU selection.** On import the training/predict modules call
+[`autocvd`](https://pypi.org/project/autocvd/) to pick a free GPU automatically.
+Override it by setting `CUDA_VISIBLE_DEVICES=<id>` to pin a device, or
+`JAX_PLATFORMS=cpu` to run on CPU (both also skip the auto-selection).
+
+**Data.** The preprocessed cache (`korg_grid_train.h5`) is built on first use
+from the raw Korg grid. Point at a prebuilt cache without copying via an
+environment variable:
 
 ```bash
 export BOSS_CACHE_DIR=/path/to/preprocessed_data     # dir holding the .h5 + sidecars
@@ -88,9 +93,29 @@ export BOSS_CACHE_DIR=/path/to/preprocessed_data     # dir holding the .h5 + sid
 ```
 
 > **Data access.** The underlying BOSS spectra and the Korg synthesis grid are
-> **not public**. They are available to members of the SDSS collaboration
-> through the SDSS data access pages ([www.sdss.org](https://www.sdss.org)); a
-> valid SDSS collaboration login is required to download them.
+> **not public**. They are available to members of the SDSS collaboration via
+> the SDSS data access pages ([www.sdss.org](https://www.sdss.org)); a valid
+> SDSS collaboration login is required to download them.
+
+## Quickstart
+
+Load a trained checkpoint and predict a spectrum from stellar labels:
+
+```python
+import numpy as np
+from boss_emulator.emulator import load_checkpoint, predict_spectra
+
+model, payload = load_checkpoint("trained_model/mlp_run/best.pkl")
+
+# one row of labels, in payload["feature_names"] order
+#   (Teff [K], logg, m_H, alpha_m, carbon_m, vmic)
+labels = np.array([[5200.0, 4.4, -0.3, 0.1, 0.0, 1.0]], dtype="float32")
+
+flux = predict_spectra(model, payload, labels)   # (1, n_pixels) normalised flux
+```
+
+The gated two-model emulator (generalist + cool-star specialist) is exposed
+through the CLI (`predict.py --specialist ...`); see the Workflow section.
 
 ---
 
@@ -168,9 +193,10 @@ Inputs accept `.npy` / `.csv` (matched by column name) / `.h5`.
 
 ### Invert (labels from spectra)
 
-Gradient descent, classical least-squares, and NUTS — all sharing one
-likelihood and results format, all able to run through the gated forward model.
-See [`script/inv_model/README.md`](script/inv_model/README.md).
+Gradient descent and classical least-squares, sharing one likelihood and
+results format, both able to run through the gated forward model, optionally
+warm-started by an amortized inverse net. See
+[`script/inv_model/README.md`](script/inv_model/README.md).
 
 ```bash
 python script/inv_model/run_gradient.py --run <generalist> --specialist <specialist> \
@@ -180,4 +206,7 @@ python script/inv_model/run_gradient_full.py --run <generalist> --specialist <sp
 
 On the full held-out set (true Korg spectra, SNR 100) the gated emulator
 recovers **Teff to ~20 K, [M/H] to ~0.03 dex** at chi²/pixel ≈ 1; `carbon_m`
-and `vmic` are the expected degenerate directions.
+and `vmic` are the weakly-constrained directions. Recovered vs. true, as a 2D
+log-density over all ~225k test spectra:
+
+![Inverse recovery](docs/inverse_recovery.png)
