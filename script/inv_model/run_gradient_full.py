@@ -68,7 +68,10 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--n-restarts", type=int, default=4, dest="n_restarts")
-    p.add_argument("--init", choices=["mid", "random", "truth"], default="mid")
+    p.add_argument("--init", choices=["mid", "random", "truth", "amortized"],
+                   default="mid")
+    p.add_argument("--amortized-net", default=None, dest="amortized_net",
+                   help="inverse-net checkpoint for --init amortized")
     p.add_argument("--fit-seed", type=int, default=0, dest="fit_seed")
     p.add_argument("--polish", type=int, default=20)
     p.add_argument("--chunk-size", type=int, default=8192, dest="chunk_size",
@@ -89,15 +92,24 @@ def main() -> None:
     rng = np.random.default_rng(args.target_seed)
     full = make_targets(args, problem, ds, test_idx, rng)   # all rows (host)
 
+    guess_phys = core = None
+    if args.init == "amortized":
+        if not args.amortized_net:
+            raise SystemExit("[inv] --init amortized needs --amortized-net PATH")
+        guess_phys, core = common.load_inverse_net(args.amortized_net)
+        print(f"[inv] amortized warm-start from {args.amortized_net}", flush=True)
+
     est_parts, chi2_parts, err_parts = [], [], []
     t0 = time.time()
     for ci in range(nchunks):
         sl = slice(ci * args.chunk_size, min((ci + 1) * args.chunk_size, N))
         sub = slice_targets(full, sl)
+        guess = (common.amortized_guess_scaled(problem, guess_phys, sub.y_obs,
+                                               core) if guess_phys else None)
         est, chi2, _ = common.fit_map(
             problem, sub, steps=args.steps, lr=args.lr,
             n_restarts=args.n_restarts, init=args.init, seed=args.fit_seed,
-            log_every=0)
+            log_every=0, guess=guess)
         if args.polish:
             est = run_gradient.polish_gauss_newton(
                 problem, sub, est, steps=args.polish)

@@ -540,13 +540,17 @@ def gauss_newton_cov(problem: Problem, theta_free, theta_full, sigma,
 # =========================================================================
 
 def initial_scaled(problem: Problem, targets: Targets, kind: str, rng,
-                   n_restarts: int) -> np.ndarray:
+                   n_restarts: int, guess=None) -> np.ndarray:
     """Starting points in the unit box, shape ``(n_restarts, n, k)``.
 
     ``mid`` is the box centre (deterministic, and deliberately far from the
     truth); ``random`` is uniform in the box; ``truth`` starts at the true
     labels, which is not a legitimate estimator but isolates "can the
-    optimiser stay at the right answer" from "can it find it".
+    optimiser stay at the right answer" from "can it find it"; ``amortized``
+    starts every target at the ``guess`` produced by an inverse net (a good
+    first estimate), which pulls the heavy-tailed stragglers into the right
+    basin. Extra restarts are jittered around the guess, and (with >=3) the
+    last one is a uniform-random safety net.
     """
     n, k = targets.n, problem.k
     if kind == "mid":
@@ -564,11 +568,72 @@ def initial_scaled(problem: Problem, targets: Targets, kind: str, rng,
         if n_restarts > 1:
             s[1:] = np.clip(s[1:] + rng.normal(0, 0.02, s[1:].shape), 0, 1)
         return s
+    if kind == "amortized":
+        if guess is None:
+            raise SystemExit("[inv] --init amortized needs --amortized-net")
+        g = np.clip(np.asarray(guess, np.float64), 0.0, 1.0)   # (n, k) scaled
+        s = np.broadcast_to(g, (n_restarts, n, k)).copy()
+        if n_restarts > 1:
+            s[1:] = np.clip(g[None] + rng.normal(0, 0.05, (n_restarts - 1, n, k)),
+                            0.0, 1.0)
+            if n_restarts >= 3:                    # one uniform-random safety net
+                s[-1] = rng.uniform(0.0, 1.0, size=(n, k))
+        return s
     raise SystemExit(f"[inv] unknown --init {kind!r}")
 
 
+def load_inverse_net(path):
+    """Load an amortized inverse net (from ``train_inverse_net.py``).
+
+    Returns ``(guess_phys, core_labels)`` where ``guess_phys(y_obs)`` maps a
+    batch of *physical* flux spectra ``(n, n_pixels)`` to *physical* core
+    labels ``(n, len(core_labels))``.
+    """
+    import pickle
+    from boss_emulator.emulator import build_model
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    model = build_model(payload["model"], payload["n_features"],
+                        payload["n_pixels"], seed=payload.get("seed", 0),
+                        hidden=tuple(payload["hidden"]),
+                        activation=payload["activation"])
+    graphdef, pstate, rest = nnx.split(model, nnx.Param, ...)
+    nnx.replace_by_pure_dict(pstate, payload["params"])
+    model = nnx.merge(graphdef, pstate, rest)
+    model.eval()
+    core = list(payload["core_labels"])
+    lo = np.asarray(payload["lo"], np.float64)
+    hi = np.asarray(payload["hi"], np.float64)
+    span = np.where(hi > lo, hi - lo, 1.0)
+    ym = jnp.asarray(payload["y_mean"], jnp.float32)
+    ys = jnp.asarray(payload["y_std"], jnp.float32)
+
+    def guess_phys(y_obs):
+        yn = (jnp.asarray(y_obs, jnp.float32) - ym) / ys
+        sc = np.asarray(model(yn), np.float64)        # scaled labels in [0, 1]
+        return lo + span * sc
+
+    return guess_phys, core
+
+
+def amortized_guess_scaled(problem: Problem, guess_phys, y_obs, core_labels):
+    """Inverse-net guess for ``y_obs``, as scaled coords in the problem box.
+
+    Maps the net's physical core-label prediction into the free-parameter order
+    and the optimiser's unit box, so it can seed :func:`fit_map`.
+    """
+    missing = [nm for nm in problem.fit_names if nm not in core_labels]
+    if missing:
+        raise SystemExit(f"[inv] amortized net lacks fit labels {missing}; "
+                         f"it predicts {core_labels}")
+    col = [core_labels.index(nm) for nm in problem.fit_names]
+    phys_fit = np.asarray(guess_phys(y_obs))[:, col]      # (n, k) physical
+    return problem.to_scaled(phys_fit)                    # (n, k) scaled
+
+
 def fit_map(problem: Problem, targets: Targets, *, steps: int, lr: float,
-            n_restarts: int, init: str, seed: int, log_every: int = 0):
+            n_restarts: int, init: str, seed: int, log_every: int = 0,
+            guess=None):
     """Projected-Adam MAP fit of every target (and restart) at once.
 
     Bound handling is projection: an Adam step is taken in the unit box and
@@ -584,7 +649,7 @@ def fit_map(problem: Problem, targets: Targets, *, steps: int, lr: float,
     _, total = make_chi2(problem, targets.sigma)
 
     # Restarts are just more independent rows in one big batch.
-    s0 = initial_scaled(problem, targets, init, rng, n_restarts)
+    s0 = initial_scaled(problem, targets, init, rng, n_restarts, guess=guess)
     s = jnp.asarray(s0.reshape(n_restarts * n, k), jnp.float32)
     theta_full = jnp.asarray(np.tile(targets.theta_true, (n_restarts, 1)),
                              jnp.float32)
