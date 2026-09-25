@@ -56,6 +56,19 @@ from boss_emulator.training import save_checkpoint
 MIN_FLUX = 1e-2
 
 
+@nnx.jit
+def train_step_weighted(model, optimizer, x, y, w):
+    """MSE with a per-row weight ``w`` (normalised inside the batch), so rows
+    from a sub-region (e.g. cool giants, --logg-max/--logg-weight) can be
+    up-weighted without changing the loss scale."""
+    def loss_fn(m):
+        per_row = jnp.mean((m(x) - y) ** 2, axis=1)
+        return jnp.sum(w * per_row) / jnp.sum(w)
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(model, grads)
+    return loss
+
+
 def gate_weight(teff, lo, hi):
     """Smooth specialist weight: 1 for Teff<=lo, 0 for Teff>=hi, linear between."""
     return np.clip((hi - teff) / (hi - lo), 0.0, 1.0).astype("float32")
@@ -81,6 +94,8 @@ def regime_report(tag, persp, T, C, G):
     print(f"\n--- {tag}: error vs regime ---", flush=True)
     for name, m in [("ALL", np.ones(persp.size, bool)),
                     ("Teff<=4000", T <= 4000),
+                    ("Teff<=4000 & logg<=2", (T <= 4000) & (G <= 2)),
+                    ("Teff<=4000 & logg<=1", (T <= 4000) & (G <= 1)),
                     ("Teff<=3500", T <= 3500),
                     ("Teff<=3500 & C>=0.5", (T <= 3500) & (C >= 0.5)),
                     ("Teff<=3000 & C>=0.5 & logg<=0.5",
@@ -99,6 +114,11 @@ def main():
     p.add_argument("--region-teff-max", type=float, default=5000.0,
                    dest="region_teff_max",
                    help="specialist trains on rows with Teff <= this")
+    p.add_argument("--logg-max", type=float, default=None, dest="logg_max",
+                   help="inside the region, rows with logg <= this get loss "
+                        "weight --logg-weight (cool giants carry most of the "
+                        "error). Default: no logg weighting.")
+    p.add_argument("--logg-weight", type=float, default=3.0, dest="logg_weight")
     p.add_argument("--gate-lo", type=float, default=3800.0, dest="gate_lo")
     p.add_argument("--gate-hi", type=float, default=4800.0, dest="gate_hi")
     p.add_argument("--epochs", type=int, default=400)
@@ -162,6 +182,17 @@ def main():
     Xva = jax.device_put(Xn[reg_va]); Yva = jax.device_put(Yn[reg_va])
     tr_pos = np.arange(reg_tr.size); va_pos = np.arange(reg_va.size)
 
+    # Optional up-weighting of the low-logg rows inside the region.
+    w_tr = np.ones(reg_tr.size, np.float32)
+    if args.logg_max is not None:
+        lowg = ds.X[reg_tr][:, ci["logg"]] <= args.logg_max
+        w_tr[lowg] = args.logg_weight
+        print(f"[spec] logg<={args.logg_max:g} rows: {lowg.sum():,} of "
+              f"{reg_tr.size:,} get loss weight x{args.logg_weight:g}", flush=True)
+    Wtr = jax.device_put(w_tr)
+    Gva = ds.X[reg_va][:, ci["logg"]]; Tva_r = ds.X[reg_va][:, ci["Teff"]]
+    corner_va = (Tva_r <= 4000) & (Gva <= 1.0)
+
     steps = max(1, reg_tr.size // args.batch_size)
     total = steps * args.epochs
     sched = optax.warmup_cosine_decay_schedule(
@@ -175,18 +206,21 @@ def main():
     for epoch in range(args.epochs):
         t0 = time.time()
         for b in data_mod.iter_batches(tr_pos, args.batch_size, seed=epoch):
-            training.train_step(spec_model, opt, Xtr[b], Ytr[b])
+            train_step_weighted(spec_model, opt, Xtr[b], Ytr[b], Wtr[b])
         spec_model.eval()
         _, persp = training.evaluate(spec_model, Xva, Yva, va_pos, y_std_dev,
                                      args.batch_size)
         spec_model.train()
+        persp = np.asarray(persp)
         obj = float(np.median(persp))
+        corner = float(np.median(persp[corner_va])) if corner_va.any() else float("nan")
         if obj < best:
             best = obj
             save_checkpoint(outdir / "best.pkl", spec_model, ds, base)
         if epoch % 20 == 0 or epoch == args.epochs - 1:
             print(f"[spec] epoch {epoch+1:4d}/{args.epochs}  "
                   f"region_val_medRMSE={obj:.4e}  best={best:.4e}  "
+                  f"corner(T<=4000,logg<=1)_med={corner:.4e}  "
                   f"({time.time()-t0:.1f}s)", flush=True)
 
     # reload best specialist for evaluation
@@ -217,7 +251,8 @@ def main():
 
     result = {
         "gate": {"lo": args.gate_lo, "hi": args.gate_hi,
-                 "region_teff_max": args.region_teff_max},
+                 "region_teff_max": args.region_teff_max,
+                 "logg_max": args.logg_max, "logg_weight": args.logg_weight},
         "generalist_only": summ(persp_gen),
         "gated": summ(persp_gated),
         "generalist_dir": str(gen_dir),

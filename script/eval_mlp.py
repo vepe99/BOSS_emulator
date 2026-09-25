@@ -40,6 +40,7 @@ autocvd claims a free GPU before JAX initialises (lab policy).
 from __future__ import annotations
 
 import argparse
+import pickle
 import json
 from pathlib import Path
 
@@ -440,9 +441,9 @@ def main():
                    help="where figures go")
     p.add_argument("--abundances", nargs="*", default=None,
                    help="abundance elements used as inputs when the run was "
-                        "trained. Pass empty (--abundances) for abundance-free "
-                        "runs (6 stellar params only). Default: the full "
-                        "ABUNDANCE_ELEMENTS set, matching legacy 27-input runs.")
+                        "trained. Default: read from the first run's checkpoint "
+                        "(data_config); pass explicitly to override, e.g. empty "
+                        "(--abundances) for abundance-free 6-input runs.")
     p.add_argument("--full-data", action="store_true",
                    help="load the whole 40 GB dataset instead of the test-only "
                         "cache (needed for runs whose split differs)")
@@ -477,8 +478,15 @@ def main():
     base = training.build_parser().parse_args([])
     base.model = "mlp"
     base.labels = list(data_mod.CORE_LABELS)
-    base.abundances = (list(data_mod.ABUNDANCE_ELEMENTS)
-                       if args.abundances is None else list(args.abundances))
+    if args.abundances is None:
+        # Match the checkpoint: guessing wrong silently misaligns the inputs
+        # (a 27-feature dataset fed to a 6-input model crashes in the matmul).
+        with open(args.run_dirs[0] / "best.pkl", "rb") as fh:
+            cfg = pickle.load(fh).get("data_config") or {}
+        base.abundances = list(cfg.get("abundance_elements",
+                                       data_mod.ABUNDANCE_ELEMENTS))
+    else:
+        base.abundances = list(args.abundances)
     base.val_frac = 0.1
     base.test_frac = 0.1
     base.seed = 0

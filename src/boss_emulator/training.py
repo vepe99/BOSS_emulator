@@ -319,6 +319,7 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
     #    physical flux units; ``val_mse`` (standardised) is kept for logging.
     ckpt_every = int(getattr(args, "ckpt_every", 0) or 0)
     best_obj = np.inf
+    diverged_for = 0
     history = []
     try:
         for epoch in range(args.epochs):
@@ -361,8 +362,17 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
             # Optuna: report and possibly prune (kills unpromising trials).
             if trial is not None:
                 trial.report(obj, step=epoch)
+                # Divergence guard. MedianPruner compares each trial's BEST
+                # value so far, so a run that starts well and then blows up
+                # (too-high LR collapsing to the mean spectrum) is never
+                # pruned and burns the full epoch budget. Prune if the
+                # objective has stayed > 3x its own best for 50 epochs.
+                diverged_for = diverged_for + 1 if obj > 3.0 * best_obj else 0
+                if diverged_for >= 50:
+                    print(f"[train] diverged: val_medRMSE={obj:.3e} > 3x best "
+                          f"{best_obj:.3e} for {diverged_for} epochs", flush=True)
                 # Keep the history/curve for the pruned run before bailing out.
-                if trial.should_prune():
+                if trial.should_prune() or diverged_for >= 50:
                     save_checkpoint(outdir / "final.pkl", model, ds, args)
                     (outdir / "history.json").write_text(
                         json.dumps(history, indent=2))

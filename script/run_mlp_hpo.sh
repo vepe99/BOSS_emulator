@@ -11,6 +11,7 @@
 # Usage:
 #     bash script/run_mlp_hpo.sh                   # 3 workers, 40 trials each
 #     N_WORKERS=3 TRIALS_PER_WORKER=40 EPOCHS=1000 bash script/run_mlp_hpo.sh
+#     OUTDIR=trained_model/combined_hpo STUDY_NAME=combined_hpo bash script/run_mlp_hpo.sh
 #
 # Point BOSS_CACHE_DIR at the preprocessed cache if it is not under
 # preprocessed_data/. Logs + run artefacts land under trained_model/mlp_hpo/.
@@ -26,8 +27,11 @@ CKPT_EVERY="${CKPT_EVERY:-250}"
 STUDY_NAME="${STUDY_NAME:-mlp_hpo}"
 STAGGER="${STAGGER:-45}"
 PYTHON="${PYTHON:-.venv/bin/python}"
+# Abundance inputs. Default = abundance-free (6 stellar labels); set
+# ABUNDANCES="Fe C ..." for the legacy 27-input variant.
+ABUNDANCES="${ABUNDANCES:-}"
 
-OUTDIR="trained_model/mlp_hpo"
+OUTDIR="${OUTDIR:-trained_model/mlp_hpo}"
 mkdir -p "$OUTDIR"
 
 echo "[hpo] launching $N_WORKERS workers x $TRIALS_PER_WORKER trials "\
@@ -43,6 +47,7 @@ for i in $(seq 0 $((N_WORKERS - 1))); do
         --n-trials "$TRIALS_PER_WORKER" \
         --epochs "$EPOCHS" \
         --ckpt-every "$CKPT_EVERY" \
+        --abundances $ABUNDANCES \
         --outdir "$OUTDIR" \
         >"$log" 2>&1 &
     pids+=($!)

@@ -71,10 +71,13 @@ def suggest_config(trial: optuna.Trial) -> dict:
             "activation", ["gelu", "silu", "relu"]),
         "residual": trial.suggest_categorical("residual", [True, False]),
         "layernorm": trial.suggest_categorical("layernorm", [True, False]),
-        "dropout": trial.suggest_float("dropout", 0.0, 0.2),
+        # Upper bounds widened (dropout 0.2 -> 0.3, weight decay 1e-3 -> 3e-2)
+        # for the 4x smaller BOSS-Grid-Combined set, where the factorial-grid
+        # winner over-fits by 10x in train/val MSE.
+        "dropout": trial.suggest_float("dropout", 0.0, 0.3),
         "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
         "weight_decay": trial.suggest_float(
-            "weight_decay", 1e-6, 1e-3, log=True),
+            "weight_decay", 1e-6, 3e-2, log=True),
         "batch_size": trial.suggest_categorical(
             "batch_size", [4096, 8192, 16384]),
     }
