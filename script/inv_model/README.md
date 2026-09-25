@@ -64,6 +64,19 @@ BOSS_CACHE_DIR=/path/to/preprocessed_data \
     --chunk-size 8192
 ```
 
+## Evaluating a full-test-set inversion
+
+`plot_inverse_eval.py` turns the `<tag>_gradient_full.npz` written by
+`run_gradient_full.py` into the inverse-model counterpart of `eval_mlp.py`:
+truth-vs-recovered 2D densities, |error| vs Teff for dwarfs and giants, error
+maps over (Teff, logg), the χ²/pixel distribution, and a JSON summary per
+label and per Teff regime.
+
+```bash
+.venv/bin/python script/inv_model/plot_inverse_eval.py \
+    plots/<dir>/<tag>_gradient_full.npz --outdir plots/<dir> --tag <tag>
+```
+
 ## Output
 
 Each run writes into `--outdir` (default `plots/inverse_modeling/`):
