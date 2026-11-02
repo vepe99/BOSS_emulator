@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch a 3-GPU Optuna hyper-parameter search for the Payne MLP emulator.
+# Launch a multi-GPU Optuna hyper-parameter search for the MLP emulator.
 #
 # Each worker is a separate process that joins the SAME shared study via
 # JournalStorage and trains its trials on its own GPU. GPUs are chosen by
@@ -9,27 +9,29 @@
 # still-idle device.
 #
 # Usage:
-#     bash script/run_payne_hpo.sh                 # 3 workers, 40 trials each
-#     N_WORKERS=3 TRIALS_PER_WORKER=40 EPOCHS=1000 bash script/run_payne_hpo.sh
+#     bash script/run_mlp_hpo.sh                   # 3 workers, 40 trials each
+#     N_WORKERS=3 TRIALS_PER_WORKER=40 EPOCHS=1000 bash script/run_mlp_hpo.sh
+#     OUTDIR=trained_model/combined_hpo STUDY_NAME=combined_hpo bash script/run_mlp_hpo.sh
 #
-# Logs + all run artefacts land under trained_model/payne_hpo/. The study is
-# resumable: re-running this script adds more trials to the same journal.
-# To stop early, kill the workers (Ctrl-C / kill); completed trials persist.
+# Point BOSS_CACHE_DIR at the preprocessed cache if it is not under
+# preprocessed_data/. Logs + run artefacts land under trained_model/mlp_hpo/.
+# The study is resumable: re-running adds more trials to the same journal.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-
-# uv cache must live on the data volume (home is over quota).
-export UV_CACHE_DIR="${UV_CACHE_DIR:-/export/data/vgiusepp/.uv_cache}"
 
 N_WORKERS="${N_WORKERS:-3}"
 TRIALS_PER_WORKER="${TRIALS_PER_WORKER:-40}"
 EPOCHS="${EPOCHS:-1000}"
 CKPT_EVERY="${CKPT_EVERY:-250}"
-STUDY_NAME="${STUDY_NAME:-payne_hpo}"
+STUDY_NAME="${STUDY_NAME:-mlp_hpo}"
 STAGGER="${STAGGER:-45}"
+PYTHON="${PYTHON:-.venv/bin/python}"
+# Abundance inputs. Default = abundance-free (6 stellar labels); set
+# ABUNDANCES="Fe C ..." for the legacy 27-input variant.
+ABUNDANCES="${ABUNDANCES:-}"
 
-OUTDIR="trained_model/payne_hpo"
+OUTDIR="${OUTDIR:-trained_model/mlp_hpo}"
 mkdir -p "$OUTDIR"
 
 echo "[hpo] launching $N_WORKERS workers x $TRIALS_PER_WORKER trials "\
@@ -40,11 +42,12 @@ pids=()
 for i in $(seq 0 $((N_WORKERS - 1))); do
     log="$OUTDIR/worker_${i}.log"
     echo "[hpo] starting worker $i -> $log"
-    nohup uv run python script/tune_payne.py \
+    nohup "$PYTHON" script/tune_mlp.py \
         --study-name "$STUDY_NAME" \
         --n-trials "$TRIALS_PER_WORKER" \
         --epochs "$EPOCHS" \
         --ckpt-every "$CKPT_EVERY" \
+        --abundances $ABUNDANCES \
         --outdir "$OUTDIR" \
         >"$log" 2>&1 &
     pids+=($!)

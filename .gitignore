@@ -7,3 +7,9 @@ __pycache__/
 *.pyc
 trained_model/
 plots/
+
+# keep README figures
+!docs/*.png
+
+# preprocessed caches (any grid)
+preprocessed_data*/

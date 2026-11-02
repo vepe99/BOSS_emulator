@@ -26,6 +26,11 @@ Two facts, verified against the file, drive the preprocessing here
   each mapped from its symbol to its column in the raw 92-element array
   via ``ELEMENT_SYMBOLS_Z``.
 
+The same layout is used by the later BOSS-Grid-Combined release (650,000
+random-sampled rows, 592,762 converged, same 169 trailing zero pixels); point
+``BOSS_RAW_PATH`` at it and ``BOSS_CACHE_DIR`` at an empty directory to build
+a separate cache for it.
+
 Building the 40 GB float32 cache is a one-time cost. Thereafter
 ``load_dataset`` just opens the cache and assembles whatever subset of
 labels the user asked for.
@@ -33,6 +38,7 @@ labels the user asked for.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,12 +47,27 @@ import numpy as np
 
 # --- paths ---------------------------------------------------------------
 
-RAW_PATH = Path("/export/data/vgiusepp/BOSS_emulator/data/korg_grid.h5")
+# Raw grid. Defaults to the original factorial BOSS-Grid; override with
+# ``BOSS_RAW_PATH`` to build a cache from another grid file with the same
+# layout (e.g. BOSS-Grid-Combined, the random-sampled 650k-row grid).
+RAW_PATH = Path(
+    os.environ.get("BOSS_RAW_PATH")
+    or "/export/data/vgiusepp/BOSS_emulator/data/korg_grid.h5")
 
 # Project root = parent of the ``src`` directory that holds this package.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CACHE_DIR = PROJECT_ROOT / "preprocessed_data"
-CACHE_PATH = CACHE_DIR / "korg_grid_train.h5"
+# Cache location. Defaults to ``<project>/preprocessed_data`` but can be
+# redirected to a shared, pre-built cache without editing code or symlinking:
+#   * ``BOSS_CACHE_DIR``  -- directory holding ``korg_grid_train.h5`` and its
+#     ``.ystats.*.npz`` sidecars;
+#   * ``BOSS_CACHE_PATH`` -- full path to the cache file itself (takes
+#     precedence; sidecars are looked up next to it).
+CACHE_DIR = Path(os.environ.get("BOSS_CACHE_DIR") or (PROJECT_ROOT / "preprocessed_data"))
+CACHE_PATH = (
+    Path(os.environ["BOSS_CACHE_PATH"])
+    if os.environ.get("BOSS_CACHE_PATH")
+    else CACHE_DIR / "korg_grid_train.h5"
+)
 
 # --- grid constants (verified against the raw file) ----------------------
 
@@ -85,9 +106,6 @@ ABUNDANCE_ELEMENTS = [e for e in CURATED_ELEMENTS if e not in FIXED_ELEMENTS]
 # Column index of each cached abundance element within the raw (N, 92)
 # array, so ``abundances[:, ABUNDANCE_COLS]`` selects them in cache order.
 ABUNDANCE_COLS = [ELEMENT_SYMBOLS_Z.index(e) for e in ABUNDANCE_ELEMENTS]
-
-# Backwards-compatible alias (the cached abundance columns, in cache order).
-VARYING_ELEMENTS = ABUNDANCE_ELEMENTS
 
 
 # =========================================================================
@@ -128,17 +146,21 @@ def build_cache(
 
         with h5py.File(tmp_path, "w") as g:
             # Target spectrum: chunked for efficient row-batch reads later.
+            # Resizable: rows can still be dropped by the flux sanity check
+            # below, so the final row count is only known after the pass.
             flux = g.create_dataset(
                 "norm_flux", shape=(n_conv, N_PIX_KEEP), dtype="float32",
+                maxshape=(None, N_PIX_KEEP),
                 chunks=(min(4096, n_conv), N_PIX_KEEP),
             )
             core = {
-                name: g.create_dataset(name, shape=(n_conv,), dtype="float32")
+                name: g.create_dataset(name, shape=(n_conv,), dtype="float32",
+                                       maxshape=(None,))
                 for name in CORE_LABELS
             }
             abund = g.create_dataset(
                 "abundances", shape=(n_conv, len(ABUNDANCE_ELEMENTS)),
-                dtype="float32",
+                dtype="float32", maxshape=(None, len(ABUNDANCE_ELEMENTS)),
             )
 
             src_flux = f["norm_flux"]
@@ -146,15 +168,30 @@ def build_cache(
             src_core = {name: f[name] for name in CORE_LABELS}
 
             write = 0
+            n_bad = 0
+            bad_rows: list[int] = []
             for start in range(0, N, chunk):
                 stop = min(start + chunk, N)
-                m = conv[start:stop]
+                m = conv[start:stop].copy()
+                if not m.any():
+                    continue
+                # norm_flux: read the chunk, mask, trim trailing zeros.
+                block = src_flux[start:stop, :N_PIX_KEEP]
+                # Sanity check: a normalised spectrum must be finite and
+                # non-negative. BOSS-Grid-Combined has (at least) one row
+                # flagged converged whose flux is the unconverged fill value
+                # -1.0 throughout; trained on, it punches a hole in the
+                # emulator (predicted flux ~ -0.6 for a whole neighbourhood).
+                ok = np.isfinite(block).all(axis=1) & (block.min(axis=1) >= 0.0)
+                bad = m & ~ok
+                if bad.any():
+                    n_bad += int(bad.sum())
+                    bad_rows += (start + np.flatnonzero(bad)).tolist()
+                    m &= ok
                 k = int(m.sum())
                 if k == 0:
                     continue
                 sl = slice(write, write + k)
-                # norm_flux: read the chunk, mask, trim trailing zeros.
-                block = src_flux[start:stop, :N_PIX_KEEP]
                 flux[sl] = block[m].astype("float32")
                 # abundances: read the full 92-col chunk, mask, then select
                 # the curated element columns (numpy fancy indexing; h5py
@@ -167,10 +204,22 @@ def build_cache(
                 print(f"\r[data] building cache: {write:,}/{n_conv:,} rows",
                       end="", flush=True)
             print()
-            assert write == n_conv, (write, n_conv)
+            assert write == n_conv - n_bad, (write, n_conv, n_bad)
+            if n_bad:
+                print(f"[data] dropped {n_bad} converged row(s) with non-finite "
+                      f"or negative flux: raw rows {bad_rows[:20]}"
+                      f"{' ...' if n_bad > 20 else ''}")
+                flux.resize(write, axis=0)
+                abund.resize(write, axis=0)
+                for d in core.values():
+                    d.resize(write, axis=0)
+                n_conv = write
 
-            # Bookkeeping metadata.
+            # Bookkeeping metadata. ``n_converged`` is the number of rows kept
+            # (converged AND sane), which is what every split is keyed on.
             g.attrs["n_converged"] = n_conv
+            g.attrs["n_dropped_bad_flux"] = n_bad
+            g.attrs["dropped_raw_rows"] = np.array(bad_rows, dtype="int64")
             g.attrs["n_pixels"] = N_PIX_KEEP
             g.attrs["n_pixels_raw"] = N_PIX_RAW
             g.attrs["n_pixels_trimmed"] = N_PIX_TRIM

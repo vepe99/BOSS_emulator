@@ -11,16 +11,21 @@ Two modes, given a run directory produced by ``training.py`` (under
    metrics comparing predicted vs. true spectra -- i.e. how well the
    emulator generates spectra on unseen labels.
 
+Optionally pass ``--specialist <run>`` to blend a cool-region specialist onto
+the generalist (``--run``) with a smooth Teff gate
+(``w*specialist + (1-w)*generalist``, ``w`` ramping from 1 below ``--gate-lo``
+to 0 above ``--gate-hi``). This applies in both modes above. It cuts
+cool-star (molecular-band) error by ~12-13% while leaving hot stars exactly as
+the generalist predicts, and stays continuous in parameter space.
+
 Usage (from the project root)::
 
     # predict for a user-supplied set of labels
-    uv run python -m boss_emulator.predict \
-        --run trained_model/payne_1700000000 --inputs my_labels.npy \
-        --output predictions.h5 --plot 8
+    .venv/bin/python -m boss_emulator.predict \
+        --run <run_dir> --inputs my_labels.csv --output predictions.h5 --plot 8
 
     # evaluate reconstruction metrics on the held-out test set
-    uv run python -m boss_emulator.predict \
-        --run trained_model/payne_1700000000 --test
+    .venv/bin/python -m boss_emulator.predict --run <run_dir> --test
 
 Supported ``--inputs`` formats
 ------------------------------
@@ -34,28 +39,20 @@ Supported ``--inputs`` formats
 
 from __future__ import annotations
 
-# --- GPU selection MUST happen before importing jax (see training.py) ----
-import os
+# GPU selection MUST happen before importing jax (lab policy). See _gpu.py.
+from boss_emulator._gpu import claim_free_gpu
 
-if not (
-    os.environ.get("BOSS_NO_AUTOCVD")
-    or os.environ.get("CUDA_VISIBLE_DEVICES")
-    or os.environ.get("JAX_PLATFORMS", "").lower() == "cpu"
-):
-    from autocvd import autocvd
-
-    autocvd(num_gpus=1)
+claim_free_gpu()
 
 import argparse
 import json
 from pathlib import Path
 
 import h5py
-import jax.numpy as jnp
 import numpy as np
 
 from boss_emulator import data as data_mod
-from boss_emulator.emulator import load_checkpoint
+from boss_emulator.emulator import load_checkpoint, predict_spectra
 
 
 def resolve_checkpoint(run: str, which: str) -> Path:
@@ -120,16 +117,45 @@ def load_inputs(path: Path, feature_names: list[str]) -> np.ndarray:
 
 
 def predict(model, payload, X: np.ndarray, batch_size: int = 4096) -> np.ndarray:
-    """Predict de-normalised spectra for raw label array ``X``."""
-    x_mean, x_std = payload["x_mean"], payload["x_std"]
-    y_mean, y_std = payload["y_mean"], payload["y_std"]
-    out = np.empty((X.shape[0], payload["n_pixels"]), dtype="float32")
-    for start in range(0, X.shape[0], batch_size):
-        stop = min(start + batch_size, X.shape[0])
-        xn = (X[start:stop] - x_mean) / x_std
-        yn = np.asarray(model(jnp.asarray(xn)))
-        out[start:stop] = yn * y_std + y_mean
-    return out
+    """Predict de-normalised spectra for raw label array ``X``.
+
+    Thin wrapper over :func:`boss_emulator.emulator.predict_spectra` (the single
+    forward recipe: standardise inputs -> model -> de-standardise outputs).
+    """
+    return predict_spectra(model, payload, X, batch_size=batch_size)
+
+
+def gate_weight(teff: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Smooth specialist weight per row: 1 for Teff<=lo, 0 for Teff>=hi, linear
+    in between. A smooth ramp (not a hard switch) keeps the emulator continuous
+    in parameter space, which matters for downstream gradient-based fitting."""
+    return np.clip((hi - teff) / (hi - lo), 0.0, 1.0).astype("float32")
+
+
+def predict_gated(gen, gpay, spec, spay, X: np.ndarray, *, lo: float, hi: float,
+                  gate_feature: str, batch_size: int = 4096) -> np.ndarray:
+    """Blend a frozen generalist with a cool-region specialist by a Teff gate.
+
+    ``output = w*specialist + (1-w)*generalist`` with ``w = gate_weight(Teff)``.
+    Each model de-normalises with its own stats and returns flux, so the blend
+    in flux space is valid regardless of standardisation; only the feature
+    layout and pixel count must agree so the label columns and outputs align.
+    """
+    if list(spay["feature_names"]) != list(gpay["feature_names"]):
+        raise ValueError(
+            f"specialist feature_names {spay['feature_names']} differ from "
+            f"generalist {gpay['feature_names']}; cannot gate")
+    if spay["n_pixels"] != gpay["n_pixels"]:
+        raise ValueError("specialist/generalist n_pixels differ; cannot gate")
+    if gate_feature not in gpay["feature_names"]:
+        raise ValueError(
+            f"gate feature {gate_feature!r} not in model features "
+            f"{gpay['feature_names']}")
+    ti = list(gpay["feature_names"]).index(gate_feature)
+    w = gate_weight(X[:, ti], lo, hi)[:, None]
+    gen_flux = predict(gen, gpay, X, batch_size)
+    spec_flux = predict(spec, spay, X, batch_size)
+    return w * spec_flux + (1.0 - w) * gen_flux
 
 
 # =========================================================================
@@ -253,9 +279,17 @@ def plot_test_metrics(pred, true, metrics, outdir: Path, n_show: int = 6):
     plt.close(fig)
 
 
-def evaluate_test(model, payload, run_dir: Path, batch_size: int,
-                  n_plot: int, save_predictions: bool) -> dict:
-    """Reconstruct the held-out test split, predict it, and report metrics."""
+def evaluate_test(predict_fn, payload, run_dir: Path, batch_size: int,
+                  n_plot: int, save_predictions: bool,
+                  outdir: Path | None = None) -> dict:
+    """Reconstruct the held-out test split, predict it, and report metrics.
+
+    ``predict_fn(X) -> flux`` is the (possibly gated) prediction closure; the
+    generalist ``payload`` supplies the ``data_config`` that defines the split.
+    ``outdir`` overrides where metrics/plots are written (default: the run dir);
+    pass a dedicated folder to keep gated-model artefacts separate from the
+    generalist's own.
+    """
     cfg = payload.get("data_config")
     if cfg is None:
         raise ValueError(
@@ -278,7 +312,7 @@ def evaluate_test(model, payload, run_dir: Path, batch_size: int,
 
     X_test = ds.X[test]
     Y_true = ds.Y[test]
-    Y_pred = predict(model, payload, X_test, batch_size=batch_size)
+    Y_pred = predict_fn(X_test)
 
     metrics = reconstruction_metrics(Y_pred, Y_true)
     summary = {k: v for k, v in metrics.items() if not k.startswith("_")}
@@ -286,7 +320,9 @@ def evaluate_test(model, payload, run_dir: Path, batch_size: int,
     for k, v in summary.items():
         print(f"        {k:26s} {v}")
 
-    out = run_dir if run_dir.is_dir() else run_dir.parent
+    out = outdir if outdir is not None else (
+        run_dir if run_dir.is_dir() else run_dir.parent)
+    out.mkdir(parents=True, exist_ok=True)
     (out / "test_metrics.json").write_text(json.dumps(summary, indent=2))
     plot_test_metrics(Y_pred, Y_true, metrics, out, n_show=max(1, n_plot or 6))
     if save_predictions:
@@ -325,6 +361,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run directory under trained_model/ or a .pkl path")
     p.add_argument("--checkpoint", choices=["best", "final"], default="best",
                    help="which checkpoint to load from a run dir")
+    p.add_argument("--specialist", default=None,
+                   help="optional cool-region specialist run dir or .pkl; when "
+                        "given, output is a smooth Teff-gated blend of the "
+                        "generalist (--run) and this specialist")
+    p.add_argument("--gate-lo", type=float, default=3800.0, dest="gate_lo",
+                   help="Teff below which the specialist fully takes over")
+    p.add_argument("--gate-hi", type=float, default=4800.0, dest="gate_hi",
+                   help="Teff above which only the generalist is used")
+    p.add_argument("--gate-feature", default="Teff", dest="gate_feature",
+                   help="label the gate ramps on (default Teff)")
     p.add_argument("--inputs",
                    help="predict mode: input labels file (.npy/.csv/.h5)")
     p.add_argument("--test", action="store_true",
@@ -340,6 +386,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-predictions", action="store_true",
                    dest="save_predictions",
                    help="test mode: also write test_predictions.h5")
+    p.add_argument("--test-outdir", default=None, dest="test_outdir",
+                   help="test mode: write metrics/plots to this folder instead "
+                        "of the run dir (use to keep gated-model plots separate)")
     return p
 
 
@@ -353,15 +402,33 @@ def main() -> None:
     print(f"[eval] loaded {ckpt}  model={payload['model']}  "
           f"features={payload['feature_names']}  n_pixels={payload['n_pixels']}")
 
+    # Build the prediction closure: plain generalist, or a gated generalist +
+    # specialist blend when --specialist is given.
+    if args.specialist:
+        spec_ckpt = resolve_checkpoint(args.specialist, args.checkpoint)
+        spec_model, spec_payload = load_checkpoint(spec_ckpt)
+        print(f"[eval] loaded specialist {spec_ckpt}  -> Teff gate "
+              f"[{args.gate_lo:.0f}, {args.gate_hi:.0f}] on {args.gate_feature!r}")
+
+        def predict_fn(X):
+            return predict_gated(
+                model, payload, spec_model, spec_payload, X,
+                lo=args.gate_lo, hi=args.gate_hi,
+                gate_feature=args.gate_feature, batch_size=args.batch_size)
+    else:
+        def predict_fn(X):
+            return predict(model, payload, X, batch_size=args.batch_size)
+
     if args.test:
-        evaluate_test(model, payload, Path(args.run), args.batch_size,
-                      args.plot, args.save_predictions)
+        evaluate_test(predict_fn, payload, Path(args.run), args.batch_size,
+                      args.plot, args.save_predictions,
+                      outdir=Path(args.test_outdir) if args.test_outdir else None)
         return
 
     # Prediction mode.
     X = load_inputs(Path(args.inputs), payload["feature_names"])
     print(f"[eval] {X.shape[0]:,} input rows -> predicting spectra")
-    spectra = predict(model, payload, X, batch_size=args.batch_size)
+    spectra = predict_fn(X)
 
     out = Path(args.output) if args.output else Path(args.run) / "predicted_spectra.h5"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -375,6 +442,11 @@ def main() -> None:
                 payload["feature_names"], dtype="S16")
             f.attrs["model"] = payload["model"]
             f.attrs["checkpoint"] = str(ckpt)
+            if args.specialist:
+                f.attrs["specialist"] = str(spec_ckpt)
+                f.attrs["gate_feature"] = args.gate_feature
+                f.attrs["gate_lo"] = args.gate_lo
+                f.attrs["gate_hi"] = args.gate_hi
     print(f"[eval] wrote {spectra.shape} spectra -> {out}")
 
     if args.plot:

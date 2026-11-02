@@ -6,56 +6,35 @@ labels that produced it. The trained emulator makes that cheap -- it is fast,
 and (being a JAX network) differentiable in its inputs -- so the same
 likelihood can be attacked three ways:
 
-  * ``run_curve_fit.py`` -- ``scipy.optimize.curve_fit``, one spectrum at a
-    time, analytic Jacobian from JAX (classic least squares + covariance).
   * ``run_gradient.py``  -- projected Adam on the chi-square, all spectra and
     all restarts optimised simultaneously on the GPU (MAP point estimate).
-  * ``run_nuts.py``      -- NumPyro NUTS, the full posterior with credible
-    intervals, r_hat/ESS diagnostics and coverage.
+    ``--full`` inverts the entire test set in chunks. ``--init amortized``
+    warm-starts from an inverse net (see ``train_inverse_net.py``).
+  * ``run_curve_fit.py`` -- ``scipy.optimize.curve_fit``, one spectrum at a
+    time, analytic Jacobian from JAX (classic least squares + covariance).
+  * ``experimental/run_nuts.py`` -- NumPyro NUTS (does not yet converge on this
+    posterior; kept as a starting point, not a working sampler).
 
-All three share the pieces defined here so their numbers are comparable:
+All share the pieces defined here so their numbers are comparable:
 
 * :func:`load_problem` -- emulator + test split + label bounds + a jitted,
-  differentiable forward map.
+  differentiable forward map. Pass ``--specialist`` to invert through the
+  gated generalist+specialist blend (see :func:`_make_gated_flux`).
 * :func:`draw_targets` -- pick test spectra, optionally add Gaussian noise;
   these are the "observations" to be inverted.
 * :func:`recovery_report`, :func:`plot_recovery`, :func:`plot_spectrum_fits`,
   :func:`save_results` -- one results format (``<tag>_<method>.npz`` plus a
   JSON summary) for every method.
 
-Two modelling choices deserve to be stated up front, because they decide what
-a run actually measures:
+**What counts as the data** (``--obs``). ``--obs korg`` (default) inverts the
+*true* Korg spectrum, so emulator error enters as model misspecification -- the
+realistic setting. ``--obs emulator`` inverts the emulator's own prediction at
+the true labels, which removes misspecification entirely and therefore measures
+pure identifiability + optimiser quality. The gap between them is the part of
+the label error that comes from emulator inaccuracy.
 
-**How the abundance inputs are handled** (``--abund-mode``). The emulator takes
-27 inputs, but they are not 27 degrees of freedom: in the Korg grid
-
-    A(E) = A_sun(E) + m_H + alpha_m * [E is alpha] + carbon_m * [E == C]
-
-*exactly* (verified per run by :func:`abundance_slaving`), so the inputs lie on
-a manifold of dimension 6. Three ways to respect that, none of them neutral:
-
-* ``slaved`` (default) -- the 21 abundances are recomputed from the free core
-  labels through the relation above. Six free parameters, every query on the
-  training manifold, and no information smuggled in.
-* ``fixed`` -- abundances pinned at their true values. This *leaks* the answer:
-  with ``A(Fe)`` known, ``m_H`` is determined, and only ~6% of the emulator's
-  metallicity sensitivity is left on the ``m_H`` input itself (for ``alpha_m``
-  and ``carbon_m`` the direct derivative is 3-8x *larger* than the on-manifold
-  one, of the opposite sign -- the network split the redundant signal across
-  duplicate channels arbitrarily). The fit then crawls along directions the
-  grid never varied.
-* ``free`` -- all 27 fitted independently. Pure extrapolation off the manifold;
-  it fits spectra well and recovers nothing (label RMSE at prior width). Kept
-  only so that claim stays checkable.
-
-``--fit-labels`` still chooses which *core* labels float.
-
-**What counts as the data.** ``--obs korg`` (default) inverts the *true* Korg
-spectrum, so emulator error enters as model misspecification -- the realistic
-setting. ``--obs emulator`` inverts the emulator's own prediction at the true
-labels, which removes misspecification entirely and therefore measures pure
-identifiability + optimiser/sampler quality. Run both: the gap between them
-is the part of the label error that comes from emulator inaccuracy.
+The models here are abundance-free (the six core labels are the inputs), so the
+free parameters are exactly those labels (``--fit-labels`` selects a subset).
 
 autocvd claims a free GPU at import time (lab policy), via
 ``boss_emulator.training``.
@@ -122,7 +101,6 @@ class Problem:
     hi: np.ndarray
     flux: callable
     n_pixels: int
-    abund_mode: str = "slaved"
 
     @property
     def k(self) -> int:
@@ -141,7 +119,7 @@ class Problem:
 
 
 def _resolve_test_idx(run_dir: Path, ds, tag: str) -> np.ndarray:
-    """The run's test rows as indices into ``ds`` (see eval_payne.py).
+    """The run's test rows as indices into ``ds`` (see eval_mlp.py).
 
     ``split_idx.npz`` is numbered in the full-dataset row space; under the
     test-only fast path ``ds`` holds just the test rows, so saved indices are
@@ -164,62 +142,12 @@ def _resolve_test_idx(run_dir: Path, ds, tag: str) -> np.ndarray:
     return pos
 
 
-# Elements whose abundance is raised by ``alpha_m`` in the Korg grid.
-ALPHA_ELEMENTS = ["O", "Mg", "Si", "S", "Ca", "Ti"]
-
-# The three core labels that drive every abundance input.
-DRIVER_LABELS = ["m_H", "alpha_m", "carbon_m"]
-
-
-def abundance_slaving(names: list[str], X: np.ndarray, tol: float = 1e-4):
-    """Express every ``A(X)`` input as an exact affine function of the
-    ``(m_H, alpha_m, carbon_m)`` triple, and verify that against ``X``.
-
-    The grid was built with
-
-        A(E) = A_sun(E) + m_H + alpha_m * [E is alpha] + carbon_m * [E == C]
-
-    so the emulator's ``n_features`` inputs really live on a manifold of
-    dimension ``len(CORE_LABELS)``. The solar zero point is recovered from the
-    data rather than hard-coded, which makes every run re-check the relation
-    it is about to rely on.
-
-    Returns ``(mask, const, coef, worst)``: ``mask[j]`` marks the abundance
-    features, ``const[j] + coef[j] @ [m_H, alpha_m, carbon_m]`` reproduces
-    them, and ``worst`` is the largest residual seen (raises if > ``tol``).
-    """
-    drv = [names.index(c) for c in DRIVER_LABELS]
-    mask = np.zeros(len(names), dtype=bool)
-    const = np.zeros(len(names), dtype=np.float64)
-    coef = np.zeros((len(names), 3), dtype=np.float64)
-    worst = 0.0
-    for j, nm in enumerate(names):
-        if not (nm.startswith("A(") and nm.endswith(")")):
-            continue
-        e = nm[2:-1]
-        c = np.array([1.0,
-                      1.0 if e in ALPHA_ELEMENTS else 0.0,
-                      1.0 if e == "C" else 0.0])
-        resid = X[:, j].astype(np.float64) - X[:, drv].astype(np.float64) @ c
-        c0 = float(np.median(resid))
-        worst = max(worst, float(np.abs(resid - c0).max()))
-        mask[j], const[j], coef[j] = True, c0, c
-    if worst > tol:
-        raise SystemExit(
-            f"[inv] abundances are not an exact affine function of "
-            f"{DRIVER_LABELS} in this split (max residual {worst:.3g} > "
-            f"{tol:g}) -- --abund-mode slaved is not valid here.")
-    return mask, const, coef, worst
-
-
-def _make_flux(model, payload, fit_idx: np.ndarray, slaving=None):
+def _make_flux(model, payload, fit_idx: np.ndarray):
     """Jitted, differentiable ``(theta_free, theta_full) -> physical flux``.
 
-    With ``slaving`` (the tuple from :func:`abundance_slaving`) the abundance
-    inputs are *recomputed* from the free core labels after the free block is
-    written, so the query always lies on the grid's 6-D manifold and no
-    information leaks in through the redundant channels. Without it the
-    abundances keep whatever ``theta_full`` supplied.
+    ``theta_free`` (the free labels) is written into the ``fit_idx`` columns of
+    ``theta_full`` (which supplies any fixed labels), standardised, run through
+    the emulator, and de-standardised back to physical flux.
     """
     graphdef, state = nnx.split(model)
     x_mean = jnp.asarray(payload["x_mean"], jnp.float32)
@@ -228,27 +156,52 @@ def _make_flux(model, payload, fit_idx: np.ndarray, slaving=None):
     y_std = jnp.asarray(payload["y_std"], jnp.float32)
     cols = jnp.asarray(fit_idx)
 
-    if slaving is None:
-        apply_slaving = None
-    else:
-        mask, const, coef, _ = slaving
-        names = list(payload["feature_names"])
-        drv = jnp.asarray([names.index(c) for c in DRIVER_LABELS])
-        m = jnp.asarray(mask)
-        cst = jnp.asarray(const, jnp.float32)
-        cf = jnp.asarray(coef, jnp.float32)
+    @jax.jit
+    def flux(theta_free, theta_full):
+        theta = theta_full.at[:, cols].set(theta_free)
+        yn = nnx.merge(graphdef, state)((theta - x_mean) / x_std)
+        return yn * y_std + y_mean
 
-        def apply_slaving(theta):
-            slaved = cst + theta[:, drv] @ cf.T      # (b, n_features)
-            return jnp.where(m, slaved, theta)
+    return flux
+
+
+def _make_gated_flux(gen_model, gen_payload, spec_model, spec_payload,
+                     fit_idx: np.ndarray, *, gate_lo, gate_hi, gate_feature):
+    """Differentiable gated forward map: a frozen generalist blended with a
+    cool-region specialist by a smooth gate on ``gate_feature`` (Teff).
+
+        flux = w * specialist + (1 - w) * generalist,
+        w = clip((gate_hi - Teff) / (gate_hi - gate_lo), 0, 1)
+
+    Each sub-model de-normalises with its own stats and returns physical flux,
+    so the blend is standardisation-agnostic; the two must share feature layout
+    and pixel count. Differentiable in ``theta_free`` -- the gate ramp is
+    piecewise-linear in Teff, so gradients flow everywhere except the clipped
+    tails (fine for projected Adam / LM). The gate follows the *current* Teff
+    estimate, so the forward model is exactly the deployed gated emulator.
+    """
+    gdef_g, st_g = nnx.split(gen_model)
+    gdef_s, st_s = nnx.split(spec_model)
+    names = list(gen_payload["feature_names"])
+    ti = names.index(gate_feature)
+    cols = jnp.asarray(fit_idx)
+
+    def _stats(p):
+        return (jnp.asarray(p["x_mean"], jnp.float32),
+                jnp.asarray(p["x_std"], jnp.float32),
+                jnp.asarray(p["y_mean"], jnp.float32),
+                jnp.asarray(p["y_std"], jnp.float32))
+    xmg, xsg, ymg, ysg = _stats(gen_payload)
+    xms, xss, yms, yss = _stats(spec_payload)
+    lo_g, hi_g = float(gate_lo), float(gate_hi)
 
     @jax.jit
     def flux(theta_free, theta_full):
         theta = theta_full.at[:, cols].set(theta_free)
-        if apply_slaving is not None:
-            theta = apply_slaving(theta)
-        yn = nnx.merge(graphdef, state)((theta - x_mean) / x_std)
-        return yn * y_std + y_mean
+        w = jnp.clip((hi_g - theta[:, ti]) / (hi_g - lo_g), 0.0, 1.0)[:, None]
+        gen = nnx.merge(gdef_g, st_g)((theta - xmg) / xsg) * ysg + ymg
+        spec = nnx.merge(gdef_s, st_s)((theta - xms) / xss) * yss + yms
+        return w * spec + (1.0 - w) * gen
 
     return flux
 
@@ -257,58 +210,64 @@ def load_problem(args) -> tuple[Problem, "data_mod.Dataset", np.ndarray]:
     """Load emulator + test split and assemble the inverse problem.
 
     Returns ``(problem, ds, test_idx)``. The dataset is the same object
-    ``eval_payne.py`` builds, so label/flux arrays and the split match the
+    ``eval_mlp.py`` builds, so label/flux arrays and the split match the
     forward-model evaluation exactly.
     """
     training.claim_gpu()
 
-    # Same data config as the HPO worker, so the split matches the trials.
+    run_dir = Path(args.run)
+    model, payload = load_checkpoint(run_dir / "best.pkl")
+    names = list(payload["feature_names"])
+
+    # Build the dataset to MATCH the checkpoint, so ds.X columns line up with
+    # the emulator's inputs. The config is read from the checkpoint itself
+    # (guessing wrong silently misaligns fit_idx).
+    cfg = payload.get("data_config") or {}
     base = training.build_parser().parse_args([])
-    base.model = "payne"
-    base.labels = list(data_mod.CORE_LABELS)
-    base.abundances = list(data_mod.ABUNDANCE_ELEMENTS)
-    base.val_frac = 0.1
-    base.test_frac = 0.1
-    base.seed = 0
+    base.model = "mlp"
+    base.labels = list(cfg.get("core_labels", data_mod.CORE_LABELS))
+    base.abundances = list(cfg.get("abundance_elements",
+                                   data_mod.ABUNDANCE_ELEMENTS))
+    base.target = cfg.get("target", "norm_flux")
+    base.val_frac = cfg.get("val_frac", 0.1)
+    base.test_frac = cfg.get("test_frac", 0.1)
+    base.seed = cfg.get("seed", 0)
+    base.max_rows = cfg.get("max_rows", None)
 
     if args.full_data:
         ds, _, _ = training.prepare_data(base)
     else:
         ds, _, _ = training.prepare_test_data(base)
 
-    run_dir = Path(args.run)
-    model, payload = load_checkpoint(run_dir / "best.pkl")
-    names = list(payload["feature_names"])
     test_idx = _resolve_test_idx(run_dir, ds, args.tag)
     print(f"[inv] {args.tag}: emulator={payload['model']} "
           f"n_features={len(names)} n_pixels={payload['n_pixels']} "
           f"n_test={test_idx.size:,}", flush=True)
+
+    # Optional cool-region specialist -> smooth Teff-gated forward map.
+    spec_model = spec_payload = None
+    if getattr(args, "specialist", None):
+        spec_dir = Path(args.specialist)
+        spec_ckpt = spec_dir if spec_dir.is_file() else spec_dir / "best.pkl"
+        spec_model, spec_payload = load_checkpoint(spec_ckpt)
+        if list(spec_payload["feature_names"]) != names:
+            raise SystemExit(
+                f"[inv] specialist features {spec_payload['feature_names']} "
+                f"!= generalist {names}; cannot gate")
+        if spec_payload["n_pixels"] != payload["n_pixels"]:
+            raise SystemExit("[inv] specialist/generalist n_pixels differ")
+        if args.gate_feature not in names:
+            raise SystemExit(f"[inv] --gate-feature {args.gate_feature!r} not "
+                             f"in emulator inputs {names}")
+        print(f"[inv] gated: specialist={spec_ckpt}  Teff gate "
+              f"[{args.gate_lo:.0f}, {args.gate_hi:.0f}] on "
+              f"{args.gate_feature!r}", flush=True)
 
     fit_names = list(args.fit_labels)
     unknown = [n for n in fit_names if n not in names]
     if unknown:
         raise SystemExit(f"[inv] --fit-labels: unknown {unknown}; "
                          f"choose from {names}")
-
-    # How the 21 redundant abundance inputs are treated (see module docstring).
-    mode = args.abund_mode
-    listed_abund = [n for n in fit_names if n.startswith("A(")]
-    if mode != "free" and listed_abund:
-        raise SystemExit(
-            f"[inv] --abund-mode {mode} contradicts --fit-labels {listed_abund}"
-            f"; use --abund-mode free to fit abundances independently.")
-    if mode == "free":
-        fit_names += [n for n in names
-                      if n.startswith("A(") and n not in fit_names]
-
-    slaving = None
-    if mode == "slaved":
-        missing = [c for c in DRIVER_LABELS if c not in fit_names]
-        if missing:
-            print(f"[inv] note: {missing} are not free, so their slaved "
-                  f"abundances stay at the truth.", flush=True)
-        slaving = abundance_slaving(names, ds.X[test_idx])
-
     fit_idx = np.array([names.index(n) for n in fit_names], dtype=np.int32)
 
     # Prior/search box: the label range actually spanned by the loaded split,
@@ -321,16 +280,17 @@ def load_problem(args) -> tuple[Problem, "data_mod.Dataset", np.ndarray]:
     for n, a, b in zip(fit_names, lo, hi):
         print(f"[inv]   free {n:10s} in [{a:.4g}, {b:.4g}]", flush=True)
 
-    if slaving is not None:
-        print(f"[inv] abundances slaved to {DRIVER_LABELS} "
-              f"(relation verified, max residual {slaving[3]:.2g})", flush=True)
+    if spec_model is not None:
+        flux = _make_gated_flux(model, payload, spec_model, spec_payload,
+                                fit_idx, gate_lo=args.gate_lo,
+                                gate_hi=args.gate_hi,
+                                gate_feature=args.gate_feature)
     else:
-        print(f"[inv] abundances: {mode}", flush=True)
+        flux = _make_flux(model, payload, fit_idx)
 
     problem = Problem(
         names=names, fit_names=fit_names, fit_idx=fit_idx, lo=lo, hi=hi,
-        flux=_make_flux(model, payload, fit_idx, slaving),
-        n_pixels=int(payload["n_pixels"]), abund_mode=mode)
+        flux=flux, n_pixels=int(payload["n_pixels"]))
     return problem, ds, test_idx
 
 
@@ -360,8 +320,8 @@ def draw_targets(args, problem: Problem, ds, test_idx: np.ndarray) -> Targets:
 
     The likelihood sigma is a flat ``1 / snr`` per pixel -- continuum-
     normalised flux is O(1), so ``--snr 100`` is a 1% per-pixel error, the
-    scale at which emulator error (median per-spectrum RMSE ~ 1e-2 for the
-    Payne runs) starts to compete with photon noise. ``--noiseless`` keeps
+    scale at which emulator error (median per-spectrum RMSE ~ 1e-3) starts to
+    compete with photon noise. ``--noiseless`` keeps
     that sigma in the likelihood but does not perturb the data, which
     separates "does noise limit the labels" from "does bias limit them".
     """
@@ -458,13 +418,17 @@ def gauss_newton_cov(problem: Problem, theta_free, theta_full, sigma,
 # =========================================================================
 
 def initial_scaled(problem: Problem, targets: Targets, kind: str, rng,
-                   n_restarts: int) -> np.ndarray:
+                   n_restarts: int, guess=None) -> np.ndarray:
     """Starting points in the unit box, shape ``(n_restarts, n, k)``.
 
     ``mid`` is the box centre (deterministic, and deliberately far from the
     truth); ``random`` is uniform in the box; ``truth`` starts at the true
     labels, which is not a legitimate estimator but isolates "can the
-    optimiser stay at the right answer" from "can it find it".
+    optimiser stay at the right answer" from "can it find it"; ``amortized``
+    starts every target at the ``guess`` produced by an inverse net (a good
+    first estimate), which pulls the heavy-tailed stragglers into the right
+    basin. Extra restarts are jittered around the guess, and (with >=3) the
+    last one is a uniform-random safety net.
     """
     n, k = targets.n, problem.k
     if kind == "mid":
@@ -482,11 +446,72 @@ def initial_scaled(problem: Problem, targets: Targets, kind: str, rng,
         if n_restarts > 1:
             s[1:] = np.clip(s[1:] + rng.normal(0, 0.02, s[1:].shape), 0, 1)
         return s
+    if kind == "amortized":
+        if guess is None:
+            raise SystemExit("[inv] --init amortized needs --amortized-net")
+        g = np.clip(np.asarray(guess, np.float64), 0.0, 1.0)   # (n, k) scaled
+        s = np.broadcast_to(g, (n_restarts, n, k)).copy()
+        if n_restarts > 1:
+            s[1:] = np.clip(g[None] + rng.normal(0, 0.05, (n_restarts - 1, n, k)),
+                            0.0, 1.0)
+            if n_restarts >= 3:                    # one uniform-random safety net
+                s[-1] = rng.uniform(0.0, 1.0, size=(n, k))
+        return s
     raise SystemExit(f"[inv] unknown --init {kind!r}")
 
 
+def load_inverse_net(path):
+    """Load an amortized inverse net (from ``train_inverse_net.py``).
+
+    Returns ``(guess_phys, core_labels)`` where ``guess_phys(y_obs)`` maps a
+    batch of *physical* flux spectra ``(n, n_pixels)`` to *physical* core
+    labels ``(n, len(core_labels))``.
+    """
+    import pickle
+    from boss_emulator.emulator import build_model
+    with open(path, "rb") as f:
+        payload = pickle.load(f)
+    model = build_model(payload["model"], payload["n_features"],
+                        payload["n_pixels"], seed=payload.get("seed", 0),
+                        hidden=tuple(payload["hidden"]),
+                        activation=payload["activation"])
+    graphdef, pstate, rest = nnx.split(model, nnx.Param, ...)
+    nnx.replace_by_pure_dict(pstate, payload["params"])
+    model = nnx.merge(graphdef, pstate, rest)
+    model.eval()
+    core = list(payload["core_labels"])
+    lo = np.asarray(payload["lo"], np.float64)
+    hi = np.asarray(payload["hi"], np.float64)
+    span = np.where(hi > lo, hi - lo, 1.0)
+    ym = jnp.asarray(payload["y_mean"], jnp.float32)
+    ys = jnp.asarray(payload["y_std"], jnp.float32)
+
+    def guess_phys(y_obs):
+        yn = (jnp.asarray(y_obs, jnp.float32) - ym) / ys
+        sc = np.asarray(model(yn), np.float64)        # scaled labels in [0, 1]
+        return lo + span * sc
+
+    return guess_phys, core
+
+
+def amortized_guess_scaled(problem: Problem, guess_phys, y_obs, core_labels):
+    """Inverse-net guess for ``y_obs``, as scaled coords in the problem box.
+
+    Maps the net's physical core-label prediction into the free-parameter order
+    and the optimiser's unit box, so it can seed :func:`fit_map`.
+    """
+    missing = [nm for nm in problem.fit_names if nm not in core_labels]
+    if missing:
+        raise SystemExit(f"[inv] amortized net lacks fit labels {missing}; "
+                         f"it predicts {core_labels}")
+    col = [core_labels.index(nm) for nm in problem.fit_names]
+    phys_fit = np.asarray(guess_phys(y_obs))[:, col]      # (n, k) physical
+    return problem.to_scaled(phys_fit)                    # (n, k) scaled
+
+
 def fit_map(problem: Problem, targets: Targets, *, steps: int, lr: float,
-            n_restarts: int, init: str, seed: int, log_every: int = 0):
+            n_restarts: int, init: str, seed: int, log_every: int = 0,
+            guess=None):
     """Projected-Adam MAP fit of every target (and restart) at once.
 
     Bound handling is projection: an Adam step is taken in the unit box and
@@ -502,7 +527,7 @@ def fit_map(problem: Problem, targets: Targets, *, steps: int, lr: float,
     _, total = make_chi2(problem, targets.sigma)
 
     # Restarts are just more independent rows in one big batch.
-    s0 = initial_scaled(problem, targets, init, rng, n_restarts)
+    s0 = initial_scaled(problem, targets, init, rng, n_restarts, guess=guess)
     s = jnp.asarray(s0.reshape(n_restarts * n, k), jnp.float32)
     theta_full = jnp.asarray(np.tile(targets.theta_true, (n_restarts, 1)),
                              jnp.float32)
@@ -699,7 +724,6 @@ def save_results(outdir: Path, tag: str, method: str, problem: Problem,
     """
     outdir.mkdir(parents=True, exist_ok=True)
     summary = {"method": method, "tag": tag,
-               "abund_mode": problem.abund_mode,
                "obs_kind": targets.obs_kind, "recovery": rep,
                "chi2_per_pixel_median": float(
                    np.median(chi2) / problem.n_pixels),
@@ -713,7 +737,7 @@ def save_results(outdir: Path, tag: str, method: str, problem: Problem,
         err=(err if err is not None else np.full_like(est, np.nan)),
         theta_true_full=targets.theta_true, rows=targets.rows,
         fit_names=np.array(problem.fit_names), lo=problem.lo, hi=problem.hi,
-        sigma=targets.sigma, abund_mode=problem.abund_mode, **arrays)
+        sigma=targets.sigma, **arrays)
     print(f"[inv] wrote {outdir / f'{tag}_{method}.npz'} (+ .json)", flush=True)
     return outdir / f"{tag}_{method}.json"
 
@@ -724,7 +748,18 @@ def save_results(outdir: Path, tag: str, method: str, problem: Problem,
 
 def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument("--run", required=True,
-                   help="run directory holding best.pkl (+ split_idx.npz)")
+                   help="run directory holding best.pkl (+ split_idx.npz); the "
+                        "generalist when --specialist is also given")
+    p.add_argument("--specialist", default=None,
+                   help="optional cool-region specialist run dir or .pkl; when "
+                        "given the forward model is the smooth Teff-gated blend "
+                        "w*specialist + (1-w)*generalist (must share features)")
+    p.add_argument("--gate-lo", type=float, default=3800.0, dest="gate_lo",
+                   help="Teff below which the specialist fully takes over")
+    p.add_argument("--gate-hi", type=float, default=4800.0, dest="gate_hi",
+                   help="Teff above which only the generalist is used")
+    p.add_argument("--gate-feature", default="Teff", dest="gate_feature",
+                   help="label the gate ramps on (default Teff)")
     p.add_argument("--tag", default=None,
                    help="prefix for output files (default: run dir name)")
     p.add_argument("--outdir", type=Path,
@@ -732,18 +767,8 @@ def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="where results and figures go")
     p.add_argument("--fit-labels", nargs="+", default=DEFAULT_FIT_LABELS,
                    dest="fit_labels", metavar="LABEL",
-                   help="which emulator inputs to infer; the rest are held at "
+                   help="which labels to infer; the rest are held at "
                         f"their true values (default: {DEFAULT_FIT_LABELS})")
-    p.add_argument("--abund-mode", dest="abund_mode",
-                   choices=["slaved", "fixed", "free"], default="slaved",
-                   help="what to do with the 21 A(X) inputs, which are an "
-                        "exact affine function of m_H/alpha_m/carbon_m in the "
-                        "grid. slaved (default): recompute them from the free "
-                        "core labels, so queries stay on the grid's 6-D "
-                        "manifold. fixed: hold them at the truth -- leaks the "
-                        "metallicity and searches off-manifold. free: fit all "
-                        "27 independently -- pure extrapolation, kept only for "
-                        "comparison")
     p.add_argument("--n-targets", type=int, default=256, dest="n_targets",
                    help="how many test spectra to invert")
     p.add_argument("--target-seed", type=int, default=0, dest="target_seed",
@@ -769,10 +794,9 @@ def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 
 def finalize_tag(args) -> None:
-    """Default ``--tag`` to the run's directory name, as eval_payne does."""
+    """Default ``--tag`` to the run's directory name (as eval_mlp does)."""
     if args.tag:
         return
     d = Path(args.run)
-    args.tag = d.parent.name if d.name.startswith(("payne_", "deeponet_",
-                                                   "transformer_",
-                                                   "singlelambda_")) else d.name
+    # Run dirs are named "<model>_<timestamp>"; use the parent (trial) name.
+    args.tag = d.parent.name if d.name.startswith(("mlp_", "payne_")) else d.name

@@ -116,8 +116,11 @@ def main() -> None:
                    help="Adam learning rate, in unit-box coordinates")
     p.add_argument("--n-restarts", type=int, default=4, dest="n_restarts",
                    help="independent starts per target; lowest chi2 wins")
-    p.add_argument("--init", choices=["mid", "random", "truth"], default="mid",
-                   help="starting point (see common.initial_scaled)")
+    p.add_argument("--init", choices=["mid", "random", "truth", "amortized"],
+                   default="mid", help="starting point (see common.initial_scaled)")
+    p.add_argument("--amortized-net", default=None, dest="amortized_net",
+                   help="inverse-net checkpoint (train_inverse_net.py) used to "
+                        "warm-start when --init amortized")
     p.add_argument("--fit-seed", type=int, default=0, dest="fit_seed",
                    help="seed for the random starting points")
     p.add_argument("--polish", type=int, default=20,
@@ -133,11 +136,20 @@ def main() -> None:
     problem, ds, test_idx = common.load_problem(args)
     targets = common.draw_targets(args, problem, ds, test_idx)
 
+    guess = None
+    if args.init == "amortized":
+        if not args.amortized_net:
+            raise SystemExit("[inv] --init amortized needs --amortized-net PATH")
+        guess_phys, core = common.load_inverse_net(args.amortized_net)
+        guess = common.amortized_guess_scaled(problem, guess_phys,
+                                              targets.y_obs, core)
+        print(f"[inv] amortized warm-start from {args.amortized_net}", flush=True)
+
     t0 = time.time()
     est, chi2, history = common.fit_map(
         problem, targets, steps=args.steps, lr=args.lr,
         n_restarts=args.n_restarts, init=args.init, seed=args.fit_seed,
-        log_every=args.log_every)
+        log_every=args.log_every, guess=guess)
     if args.polish:
         est = polish_gauss_newton(problem, targets, est, steps=args.polish)
         chi2_rows, _ = common.make_chi2(problem, targets.sigma)

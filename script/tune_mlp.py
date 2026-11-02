@@ -1,13 +1,13 @@
-"""Optuna hyper-parameter search for the Payne MLP emulator.
+"""Optuna hyper-parameter search for the MLP emulator.
 
 This is *one worker*. Launch several (one per GPU) pointing at the same
 ``JournalStorage`` file and they cooperate on a single shared study -- each
 process pulls the next trial, trains it on its own GPU, and writes results back
-to the journal. See ``script/run_payne_hpo.sh`` for the 3-GPU launcher.
+to the journal. See ``script/run_mlp_hpo.sh`` for the 3-GPU launcher.
 
 What a trial does
 -----------------
-* Samples a Payne configuration (depth/width, activation, residual + LayerNorm
+* Samples an MLP configuration (depth/width, activation, residual + LayerNorm
   toggles, dropout, LR, weight decay, batch size).
 * Trains it for ``--epochs`` (>=1000) on the *full* dataset, saving models
   while training (``best.pkl`` on the objective, periodic ``epoch_XXXX.pkl``,
@@ -32,8 +32,8 @@ device before it looks busy.
 
 Example
 -------
-    UV_CACHE_DIR=/export/data/vgiusepp/.uv_cache \
-    uv run python script/tune_payne.py --n-trials 40 --epochs 1000
+    BOSS_CACHE_DIR=/path/to/preprocessed_data \
+    .venv/bin/python script/tune_mlp.py --n-trials 40 --epochs 1000
 """
 
 from __future__ import annotations
@@ -62,21 +62,24 @@ from boss_emulator.emulator import load_checkpoint
 # =========================================================================
 
 def suggest_config(trial: optuna.Trial) -> dict:
-    """Sample one Payne configuration from the search space."""
+    """Sample one MLP configuration from the search space."""
     n_layers = trial.suggest_int("n_layers", 3, 8)
-    width = trial.suggest_categorical("width", [512, 1024, 2048])
+    width = trial.suggest_int("width", 800, 4096)
     return {
         "hidden": [width] * n_layers,
         "activation": trial.suggest_categorical(
             "activation", ["gelu", "silu", "relu"]),
         "residual": trial.suggest_categorical("residual", [True, False]),
         "layernorm": trial.suggest_categorical("layernorm", [True, False]),
-        "dropout": trial.suggest_float("dropout", 0.0, 0.2),
+        # Upper bounds widened (dropout 0.2 -> 0.3, weight decay 1e-3 -> 3e-2)
+        # for the 4x smaller BOSS-Grid-Combined set, where the factorial-grid
+        # winner over-fits by 10x in train/val MSE.
+        "dropout": trial.suggest_float("dropout", 0.0, 0.3),
         "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
         "weight_decay": trial.suggest_float(
-            "weight_decay", 1e-6, 1e-3, log=True),
+            "weight_decay", 1e-6, 3e-2, log=True),
         "batch_size": trial.suggest_categorical(
-            "batch_size", [512, 1024, 2048, 4096]),
+            "batch_size", [4096, 8192, 16384]),
     }
 
 
@@ -111,7 +114,7 @@ def make_objective(base_args, prepared, study_outdir: Path):
 
         # Per-trial training args: copy the base config, apply the sample.
         a = copy.deepcopy(base_args)
-        a.model = "payne"
+        a.model = "mlp"
         a.hidden = cfg["hidden"]
         a.activation = cfg["activation"]
         a.residual = cfg["residual"]
@@ -147,8 +150,8 @@ def make_objective(base_args, prepared, study_outdir: Path):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Optuna HPO worker for the Payne MLP emulator.")
-    p.add_argument("--study-name", default="payne_hpo", dest="study_name")
+        description="Optuna HPO worker for the MLP emulator.")
+    p.add_argument("--study-name", default="mlp_hpo", dest="study_name")
     p.add_argument("--n-trials", type=int, default=40, dest="n_trials",
                    help="trials THIS worker runs (3 workers x 40 = 120)")
     p.add_argument("--epochs", type=int, default=1000,
@@ -167,7 +170,7 @@ def parse_args():
     p.add_argument("--max-rows", type=int, default=None, dest="max_rows",
                    help="use only N rows (quick end-to-end dry run)")
     p.add_argument("--outdir",
-                   default=str(data_mod.PROJECT_ROOT / "trained_model" / "payne_hpo"))
+                   default=str(data_mod.PROJECT_ROOT / "trained_model" / "mlp_hpo"))
     p.add_argument("--storage",
                    default=None,
                    help="JournalStorage log path "
@@ -204,7 +207,7 @@ def main():
 
     # 2. Base training args (defaults from the training parser, then overrides).
     base_args = training.build_parser().parse_args([])
-    base_args.model = "payne"
+    base_args.model = "mlp"
     base_args.epochs = args.epochs
     base_args.ckpt_every = args.ckpt_every
     base_args.labels = args.labels
