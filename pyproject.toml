@@ -3,7 +3,7 @@ name = "boss-emulator"
 version = "0.1.0"
 description = "An emulator for BOSS spectra"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "autocvd",
     "numpy",
@@ -18,6 +18,11 @@ dependencies = [
     "optuna>=4.9.0",
     "numpyro>=0.21.0",
     "optimistix>=0.1.0",
+]
+
+[project.optional-dependencies]
+sbi = [
+    "bayesflow>=2.1.0",
 ]
 
 [build-system]
