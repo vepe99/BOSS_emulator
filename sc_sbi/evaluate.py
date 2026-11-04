@@ -120,19 +120,28 @@ def prior_variance(box, n=400_000, seed=0):
     return v
 
 
-def make_chi2(emulator_fn):
+def make_chi2(emulator_fn, cont_deg: int = 0):
+    """chi2/pixel of the run's forward model at the posterior median: emulator
+    [-> LSF of sigma ``lsf``] [-> profiled Chebyshev continuum] (v3)."""
+    basis = jnp.asarray(C.cheb_basis(cont_deg)) if cont_deg > 0 else None
+
     @jax.jit
-    def chi2(theta, flux, ivar):
+    def chi2(theta, flux, ivar, lsf):
         mu = emulator_fn(theta)
+        if lsf is not None:
+            mu = C.apply_lsf(mu, lsf)
+        if basis is not None:
+            mu = C.profile_continuum(mu, flux, ivar, basis)
         good = jnp.sum(ivar > 0, axis=1)
         return jnp.sum(ivar * (flux - mu) ** 2, axis=1) / jnp.maximum(good, 1)
 
-    def run(theta, flux, ivar, batch=1024, s_m=None):
+    def run(theta, flux, ivar, batch=1024, s_m=None, lsf=None):
         if s_m is not None:
             ivar = ivar / (1.0 + ivar * s_m[None] ** 2)
+        sl = lambda x, s: None if x is None else jnp.asarray(x[s:s + batch])
         return np.concatenate([np.asarray(chi2(jnp.asarray(theta[s:s + batch]),
                                                jnp.asarray(flux[s:s + batch]),
-                                               jnp.asarray(ivar[s:s + batch])))
+                                               jnp.asarray(ivar[s:s + batch]), sl(lsf, s)))
                                for s in range(0, theta.shape[0], batch)])
     return run
 
@@ -342,7 +351,8 @@ def main():
     mm = C.load_mismatch(ncfg)
     floor = parse_floor(args.ref_floor)
     box = {k: tuple(v) for k, v in cfg["box"].items()}
-    adapter = C.shared_adapter({k: tuple(v) for k, v in cfg["padded_box"].items()})
+    adapter = C.shared_adapter({k: tuple(v) for k, v in cfg["padded_box"].items()},
+                               cfg.get("log_params"))
     splits = np.load(run_dir / "splits.npz")
     if args.models:
         models = args.models
@@ -392,7 +402,9 @@ def main():
 
     example = adapter(C.label_dict(Lk[:2]) | {k: v[:2] for k, v in cond_k.items()})
     pvar = prior_variance(box)
-    chi2_fn = None if args.no_ppc else make_chi2(C.make_emulator_fn(cfg["emulator"]))
+    chi2_fn = None if args.no_ppc else make_chi2(C.make_emulator_fn(cfg["emulator"]), ncfg["cont_deg"])
+    names = C.params(ncfg)                      # 6 labels (+ lsf_px for v3, scored separately)
+    lsf_true_k = cond_k.get(C.LSF)
 
     metrics = {"config": {"n_korg": int(Lk.shape[0]), "n_boss": int(rows.size),
                           "n_repeat_stars": int(len(pairs)), "n_samples": args.n_samples,
@@ -403,8 +415,12 @@ def main():
         post = C.load_posterior(run_dir, m, example)
         if not C.weights_finite(post):
             C.log(f"[{m}] WARNING: non-finite weights (diverged run) -- metrics will be NaN")
-        sk = C.sample_posterior(post, adapter, cond_k, args.n_samples)
-        sb = C.sample_posterior(post, adapter, cond_b, args.n_samples)
+        sk = C.sample_posterior(post, adapter, cond_k, args.n_samples, names=names)
+        sb = C.sample_posterior(post, adapter, cond_b, args.n_samples, names=names)
+        lsf_k = lsf_b = None
+        if ncfg["lsf"]:                         # lsf_px: nuisance, kept out of the label metrics
+            lsf_k, lsf_b = np.median(sk[..., -1], 1), np.median(sb[..., -1], 1)
+            sk, sb = sk[..., :-1], sb[..., :-1]
         Sk, Sbb = summarize(sk), summarize(sb)
         med_k[m], med_b[m] = Sk["median"], Sbb["median"][:, bcols]
         ranks_k[m] = np.stack([sbc_ranks(sk[:, :, i], Lk[:, i]) for i in range(len(C.LABELS))], 1)
@@ -453,13 +469,21 @@ def main():
             metrics[m]["repeat"] = rep
 
         if chi2_fn is not None:
-            chi2_k[m] = chi2_fn(Sk["median"], cond_k["flux"], cond_k["ivar"])
-            chi2_b[m] = chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"])
+            chi2_k[m] = chi2_fn(Sk["median"], cond_k["flux"], cond_k["ivar"], lsf=lsf_k)
+            chi2_b[m] = chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"], lsf=lsf_b)
             metrics[m]["korg_chi2_median"] = float(np.nanmedian(chi2_k[m]))
             metrics[m]["boss_chi2_median"] = float(np.nanmedian(chi2_b[m]))
             if mm is not None:
                 metrics[m]["boss_chi2_sm_median"] = float(np.nanmedian(
-                    chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"], s_m=mm.s_m)))
+                    chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"], s_m=mm.s_m, lsf=lsf_b)))
+        if lsf_k is not None:
+            t = np.asarray(lsf_true_k).ravel()
+            metrics[m]["lsf"] = {"korg_mae": float(np.mean(np.abs(lsf_k - t))),
+                                 "korg_bias": float(np.mean(lsf_k - t)),
+                                 "boss_median": float(np.nanmedian(lsf_b)),
+                                 "boss_p16_p84": np.nanpercentile(lsf_b, [16, 84]).tolist()}
+            C.log(f"[{m}] lsf_px: Korg MAE {metrics[m]['lsf']['korg_mae']:.3f}  "
+                  f"BOSS median {metrics[m]['lsf']['boss_median']:.2f}")
 
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
 

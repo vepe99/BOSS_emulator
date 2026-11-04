@@ -65,7 +65,7 @@ import bayesflow.experimental.self_consistency as sc
 # --- paths ---------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-KORG_CACHE = PROJECT_ROOT / "data_jarvis/preprocessed_data_combined_v2/korg_grid_train.h5"
+KORG_CACHE = Path("/export/scratch/lbranca/BOSS_emulator/preprocessed_data_combined_v2/korg_grid_train.h5")
 BOSS_NPZ = PROJECT_ROOT / "boss_clam/boss_clam_training_data.npz"
 BOSS_PREPARED = PROJECT_ROOT / "sc_sbi/cache/boss_clam_prepared.npz"
 EMULATOR_CKPT = PROJECT_ROOT / "trained_model/combined_best/mlp_1790330838/best.pkl"
@@ -77,6 +77,7 @@ LOG_LABELS = ["vmic"]                      # sampled log-uniformly in the grid
 N_PIX = data_mod.N_PIX_KEEP                # 4479
 # labels that also exist in the BOSS reference catalogue (vmic/carbon do not)
 BOSS_LABELS = ["Teff", "logg", "m_H", "alpha_m"]
+LSF = "lsf_px"                             # v3: Gaussian LSF sigma [pixels], 7th posterior parameter
 BOSS_FIELDS = {"Teff": "teff", "logg": "logg", "m_H": "fe_h", "alpha_m": "raw_alpha_m_atm"}
 BOSS_ERR_FIELDS = {"Teff": "e_teff", "logg": "e_logg", "m_H": "e_fe_h",
                    "alpha_m": "raw_e_alpha_m_atm"}
@@ -229,7 +230,89 @@ NOISE_DEFAULTS = {
     "sm_mask_thresh": None,    # mask pixels with s_m > thresh everywhere
     "likelihood_sm": False,    # SC likelihood uses sigma^2 + s_m^2
     "resid_frac": 0.5,         # residual mode: fraction of rows using a real residual
+    # --- v3 forward model (L. Branca's BOSS inversion recipe) ---
+    "lsf": False,              # Gaussian LSF conv(emu, lsf_px); lsf_px inferred (7th parameter)
+    "lsf_range": [0.3, 4.0],   # lsf_px prior box [pixels]
+    "cont_deg": 0,             # SC likelihood: profile a Chebyshev continuum of this degree
+    "cont_tilt": 0.0,          # simulations: random multiplicative Chebyshev continuum, coef std
 }
+
+
+def params(ncfg: dict | None) -> list:
+    """Posterior parameters: the 6 emulator labels (+ lsf_px with the v3 LSF)."""
+    return LABELS + ([LSF] if noise_config(ncfg)["lsf"] else [])
+
+
+# ---- v3 forward model ------------------------------------------------------
+
+K_HALF = 10                                 # LSF half-window [px] (>= 2.5 sigma_max)
+
+
+def apply_lsf(flux, sigma):
+    """Per-spectrum Gaussian convolution in pixel space (BOSS is uniform in
+    log-lambda, so a velocity kernel is a constant-pixel kernel). ``flux``
+    (n, P), ``sigma`` in pixels: (n,) one width per spectrum, or (n, P) one width
+    per output pixel (e.g. from WDISP, see ``korg_lsf_sigma``). Same kernel as
+    script/inv_model/run_observed.py."""
+    offs = jnp.arange(-K_HALF, K_HALF + 1, dtype=jnp.float32)
+    sig = jnp.maximum(jnp.asarray(sigma, jnp.float32), 0.05)
+    sig = sig[:, None] if sig.ndim == 1 else sig                # (n, 1) or (n, P)
+    w = jnp.exp(-0.5 * (offs / sig[..., None]) ** 2)            # (n, 1|P, 2K+1)
+    w = w / jnp.sum(w, axis=-1, keepdims=True)
+    pad = jnp.pad(flux, ((0, 0), (K_HALF, K_HALF)), mode="edge")
+    out = jnp.zeros_like(flux)
+    for j in range(2 * K_HALF + 1):
+        out = out + w[..., j] * pad[:, j:j + flux.shape[1]]
+    return out
+
+
+def korg_lsf_sigma(wdisp, kappa=1.1, r_grid=5000.0, point_sampled=True):
+    """Extra Gaussian sigma [px] taking the Korg grid (R=lambda/FWHM=``r_grid``,
+    1e-4 dex pixels) to the BOSS LSF given by ``wdisp`` [px] (..., P):
+    sigma_k^2 = (kappa*WDISP)^2 - sigma_grid^2 (+ 1/12 px^2 pixel integration if the
+    grid was point-sampled onto the pixels rather than flux-rebinned)."""
+    s_grid = 1.0 / (r_grid * 2.3548 * np.log(10) * 1e-4)        # 0.369 px at R=5000
+    s2 = (kappa * np.asarray(wdisp, np.float64)) ** 2 - s_grid ** 2 + (1 / 12 if point_sampled else 0.0)
+    return np.sqrt(np.clip(s2, 0.05 ** 2, None)).astype(np.float32)
+
+
+def cheb_basis(deg: int, npx: int = None) -> np.ndarray:
+    """(npx, deg+1) Chebyshev polynomials on x in [-1, 1] across the pixels."""
+    x = np.linspace(-1.0, 1.0, npx or N_PIX)
+    return np.polynomial.chebyshev.chebvander(x, deg).astype(np.float32)
+
+
+def profile_continuum(f, y, W, B):
+    """Model ``f`` times the best multiplicative continuum ``B a`` for data ``y``
+    with weights ``W``: ``a`` minimises ``sum W (y - f B a)^2`` in closed form."""
+    K = B.shape[1]
+    BB = (B[:, :, None] * B[:, None, :]).reshape(B.shape[0], K * K)
+    M = ((W * f * f) @ BB).reshape(-1, K, K) + 1e-6 * jnp.eye(K)[None]
+    a = jnp.linalg.solve(M, ((W * f * y) @ B)[..., None])[..., 0]
+    return f * (a @ B.T)
+
+
+def draw_forward_aug(ncfg: dict, n: int, rng: np.random.Generator):
+    """Per-spectrum v3 simulator nuisances: ``lsf`` (n,) ~ U(lsf_range) or None,
+    ``coefs`` (n, deg+1) of a multiplicative Chebyshev continuum
+    ``1 + sum_j a_j T_j`` with ``a_j ~ N(0, cont_tilt / (j + 1))`` or None."""
+    c = noise_config(ncfg)
+    lsf = (rng.uniform(*c["lsf_range"], size=n).astype("float32") if c["lsf"] else None)
+    coefs = None
+    if c["cont_tilt"] > 0:
+        deg = max(int(c["cont_deg"]), 1)
+        coefs = (rng.standard_normal((n, deg + 1)) * c["cont_tilt"]
+                 / np.arange(1, deg + 2)).astype("float32")
+    return lsf, coefs
+
+
+def forward_aug(flux, lsf, coefs, basis):
+    """Korg flux -> what BOSS would record before noise: LSF, then continuum tilt."""
+    if lsf is not None:
+        flux = apply_lsf(flux, lsf)
+    if coefs is not None:
+        flux = flux * (1.0 + coefs @ basis.T)
+    return flux
 
 
 def noise_config(cfg: dict | None) -> dict:
@@ -326,6 +409,10 @@ class NoiseModel:
 
     def make_batch(self, flux, labels, rng):
         n = flux.shape[0]
+        lsf, coefs = draw_forward_aug(self.cfg, n, rng)
+        if lsf is not None or coefs is not None:
+            basis = jnp.asarray(cheb_basis(coefs.shape[1] - 1)) if coefs is not None else None
+            flux = np.asarray(forward_aug(jnp.asarray(flux), lsf, coefs, basis))
         j = rng.integers(0, len(self.t), size=n)
         iv = self.t.ivar[j].copy()
         snr = self.t.snr[j].copy()
@@ -345,16 +432,47 @@ class NoiseModel:
                 iv[r] = self.bank_ivar[b]
                 snr[r] = self.bank_snr[b]
         noisy = np.where(iv > 0, noisy, 1.0).astype("float32")
-        return spectrum_features(noisy, iv, snr, self.cfg, self.mm)
+        out = spectrum_features(noisy, iv, snr, self.cfg, self.mm)
+        if lsf is not None:
+            out[LSF] = lsf[:, None]
+        return out
 
 
 def label_dict(labels: np.ndarray) -> dict:
     return {k: labels[:, i:i + 1].astype("float32") for i, k in enumerate(LABELS)}
 
 
+@jax.jit
+def _gpu_noisy_batch(key, flux_all, ivar_t, sig_t, snr_t, i, j, s_m_noise, s_m_feat, mask,
+                     measured, aug=(None, None, None)):
+    """GPU twin of ``NoiseModel.make_batch`` (template / sm) + ``spectrum_features``.
+    One Gaussian draw with sigma = sqrt(sigma_photon^2 + s_m^2) == the two
+    independent draws of the CPU path. ``measured`` is a traced bool; sigma_feat
+    is always computed (the caller drops it without ``noise_channel``)."""
+    f, iv, snr = flux_all[i], ivar_t[j], snr_t[j]
+    f = forward_aug(f, *aug)                    # v3: LSF + continuum tilt (no-op otherwise)
+    sig = jnp.sqrt(sig_t[j] ** 2 + s_m_noise[None] ** 2)
+    noisy = f + jax.random.normal(key, f.shape, f.dtype) * sig
+    noisy = jnp.where(iv > 0, noisy, 1.0)
+    iv = jnp.where(mask[None], 0.0, iv)
+    noisy = jnp.where(mask[None], 1.0, noisy)
+    good = iv > 0
+    snr_m = (jnp.where(good, noisy * jnp.sqrt(jnp.maximum(iv, 0.0)), 0.0).sum(1)
+             / jnp.maximum(good.sum(1), 1))
+    snr = jnp.where(measured, snr_m, snr)
+    out = {"flux": noisy, "ivar": iv, "log_snr": jnp.log10(jnp.maximum(snr, 1e-3))[:, None]}
+    sf = jnp.sqrt(jnp.where(good, 1.0 / jnp.maximum(iv, 1e-30), 1.0) + s_m_feat[None] ** 2)
+    out["sigma_feat"] = jnp.where(good, jnp.minimum(sf, 1.0), 1.0)
+    return out
+
+
 class KorgNoisyDataset(keras.utils.PyDataset):
     """Labeled batches: Korg spectra + fresh real-BOSS noise every draw.
-    ``drop_labels=True`` yields unlabeled batches (SC sanity check on Korg)."""
+    ``drop_labels=True`` yields unlabeled batches (SC sanity check on Korg).
+
+    With a template/sm ``NoiseModel`` the flux, templates and noise live on
+    the GPU (no per-step host->device copy, no CPU RNG); the residual mode
+    keeps the CPU path."""
 
     def __init__(self, labels, flux, templates, batch_size: int,
                  num_batches: int, adapter, seed: int = 0, drop_labels: bool = False,
@@ -364,11 +482,42 @@ class KorgNoisyDataset(keras.utils.PyDataset):
         self.batch_size, self._num_batches, self.adapter = batch_size, num_batches, adapter
         self.drop_labels = drop_labels
         self.rng = np.random.default_rng(seed)
+        self.gpu = isinstance(templates, NoiseModel) and templates.mode != "residual"
+        if self.gpu:
+            t, mm, cfg = templates.t, templates.mm, templates.cfg
+            zero = np.zeros(N_PIX, "float32")
+            s_m = zero if mm is None else mm.s_m
+            self.dev = dict(
+                flux_all=jax.device_put(flux), ivar_t=jax.device_put(t.ivar),
+                sig_t=jax.device_put(t.sigma), snr_t=jax.device_put(t.snr.astype("float32")),
+                s_m_noise=jnp.asarray(s_m if templates.mode == "sm" else zero),
+                s_m_feat=jnp.asarray(s_m),
+                mask=jnp.asarray(np.zeros(N_PIX, bool) if mm is None else mm.mask),
+                measured=jnp.asarray(cfg["snr_mode"] == "measured"))
+            self.noise_channel = bool(cfg["noise_channel"])
+            self.key, self.calls = jax.random.key(seed), 0
+            self.basis = (jnp.asarray(cheb_basis(max(int(cfg["cont_deg"]), 1)))
+                          if cfg["cont_tilt"] > 0 else None)
+
+    def _gpu_batch(self, i):
+        j = self.rng.integers(0, len(self.templates.t), size=self.batch_size)
+        lsf, coefs = draw_forward_aug(self.templates.cfg, self.batch_size, self.rng)
+        self.calls += 1
+        out = _gpu_noisy_batch(jax.random.fold_in(self.key, self.calls), i=i, j=j,
+                               aug=(lsf, coefs, self.basis if coefs is not None else None),
+                               **self.dev)
+        if not self.noise_channel:
+            out.pop("sigma_feat")
+        if lsf is not None:
+            out[LSF] = jnp.asarray(lsf)[:, None]
+        return out
 
     def __getitem__(self, item):
         i = self.rng.integers(0, self.labels.shape[0], size=self.batch_size)
-        batch = self.templates.make_batch(self.flux[i], self.labels[i], self.rng)
+        batch = (self._gpu_batch(i) if self.gpu
+                 else self.templates.make_batch(self.flux[i], self.labels[i], self.rng))
         if self.drop_labels:
+            batch.pop(LSF, None)
             return self.adapter(batch, strict=False)
         return self.adapter(label_dict(self.labels[i]) | batch)
 
@@ -381,19 +530,21 @@ class KorgNoisyDataset(keras.utils.PyDataset):
 
 
 class BossDataset(keras.utils.PyDataset):
-    """Unlabeled batches: real BOSS spectra (flux, ivar, log SNR[, sigma_feat])."""
+    """Unlabeled batches: real BOSS spectra (flux, ivar, log SNR[, sigma_feat]).
+    The features are held on the GPU; each batch is a device-side gather."""
 
     def __init__(self, flux, ivar, snr, batch_size: int, num_batches: int,
                  adapter, seed: int = 1, ncfg: dict | None = None,
                  mm: Mismatch | None = None, **kwargs):
         super().__init__(**kwargs)
         feats = spectrum_features(flux, ivar, snr, ncfg, mm)
-        self.feats = feats
+        self.feats = {k: jax.device_put(v) for k, v in feats.items()}
+        self.n = feats["flux"].shape[0]
         self.batch_size, self._num_batches, self.adapter = batch_size, num_batches, adapter
         self.rng = np.random.default_rng(seed)
 
     def __getitem__(self, item):
-        i = self.rng.integers(0, self.feats["flux"].shape[0], size=self.batch_size)
+        i = jnp.asarray(self.rng.integers(0, self.n, size=self.batch_size))
         return self.adapter({k: v[i] for k, v in self.feats.items()}, strict=False)
 
     @property
@@ -423,20 +574,28 @@ def padded_box(box: dict, pad: float = 0.01) -> dict:
     return out
 
 
-def shared_adapter(pbox: dict) -> bf.Adapter:
-    """Maps each label to an unbounded space (vmic: log first)."""
+def shared_adapter(pbox: dict, log_params=None) -> bf.Adapter:
+    """Maps each label to an unbounded space: ``log`` first for ``log_params``
+    (default ``LOG_LABELS`` = vmic), then a bounded logit on the padded box.
+
+    This is only the network's *parametrisation*. The prior is set by the
+    simulations (the Korg grid: uniform Teff, log-uniform vmic) and, in SC, by
+    ``prior_log_prob`` evaluated in physical space with bayesflow adding the
+    adapter's log-Jacobian -- so e.g. ``log_params=["vmic", "Teff"]`` (run
+    v3_logTeff) keeps the Teff prior uniform. Do not add -log(Teff) to the prior."""
+    logs = LOG_LABELS if log_params is None else list(log_params)
     a = bf.Adapter()
-    for k in LABELS:
+    for k in LABELS + ([LSF] if LSF in pbox else []):
         lo, hi = pbox[k]
-        if k in LOG_LABELS:
+        if k in logs:
             a = a.log(k).constrain(k, lower=float(np.log(lo)), upper=float(np.log(hi)))
         else:
             a = a.constrain(k, lower=float(lo), upper=float(hi))
     return a
 
 
-def posterior_adapter(noise_channel: bool = False) -> bf.Adapter:
-    a = bf.Adapter().drop("ivar").concatenate(LABELS, into="inference_variables")
+def posterior_adapter(noise_channel: bool = False, names=None) -> bf.Adapter:
+    a = bf.Adapter().drop("ivar").concatenate(list(names or LABELS), into="inference_variables")
     if noise_channel:   # summary input = [flux | sigma_feat], shape (n, 2 * N_PIX)
         a = a.concatenate(["flux", "sigma_feat"], into="summary_variables")
     else:
@@ -445,8 +604,9 @@ def posterior_adapter(noise_channel: bool = False) -> bf.Adapter:
 
 
 def prior_log_prob(vmic, **kwargs):
-    """Uniform in the box for 5 labels, log-uniform in vmic (unnormalised;
-    samples never leave the box because of the bounded constraint)."""
+    """Uniform in the box for 5 labels (and lsf_px), log-uniform in vmic, in
+    *physical* units -- the Korg grid's sampling -- whatever ``shared_adapter``'s
+    ``log_params`` (unnormalised; samples never leave the box)."""
     return -jnp.log(jnp.squeeze(vmic, -1))
 
 
@@ -469,25 +629,34 @@ def make_emulator_fn(ckpt=EMULATOR_CKPT):
 
 
 def make_likelihood(emulator_fn, sigma_floor: float = 0.0, s_m: np.ndarray | None = None,
-                    pixel_mask: np.ndarray | None = None):
+                    pixel_mask: np.ndarray | None = None, lsf: bool = False, cont_deg: int = 0):
     """``log p(y | theta) = -1/2 sum ivar_eff (y - emu(theta))^2`` (unnormalised).
 
     ``ivar_eff = ivar / (1 + ivar * (floor^2 + s_m^2))``: an optional scalar
     systematic floor and/or a per-pixel model-mismatch scatter ``s_m``
     (BOSS-CLAM style). ``pixel_mask`` (True = drop) zeroes pixels. Since
     ``s_m`` is fixed, the omitted ``log(sigma^2 + s_m^2)`` term is a
-    constant in theta and cancels in the SC variance."""
+    constant in theta and cancels in the SC variance.
+
+    v3: ``lsf`` convolves the emulator flux with a Gaussian of sigma
+    ``theta["lsf_px"]``; ``cont_deg > 0`` multiplies it by the best-fit
+    Chebyshev continuum (profiled per spectrum and draw, weights ``ivar_eff``)."""
     extra = np.full(N_PIX, float(sigma_floor) ** 2, "float32")
     if s_m is not None:
         extra = extra + np.asarray(s_m, "float32") ** 2
     keep = np.ones(N_PIX, "float32") if pixel_mask is None else (~pixel_mask).astype("float32")
     extra_j, keep_j = jnp.asarray(extra), jnp.asarray(keep)
     plain = not np.any(extra) and pixel_mask is None
+    basis = jnp.asarray(cheb_basis(cont_deg)) if cont_deg > 0 else None
 
     def likelihood_log_prob(flux, ivar, **theta):
         th = jnp.concatenate([jnp.reshape(theta[k], (-1, 1)) for k in LABELS], axis=1)
         mu = emulator_fn(th.astype(jnp.float32))
         iv = ivar if plain else keep_j * ivar / (1.0 + ivar * extra_j)
+        if lsf:
+            mu = apply_lsf(mu, theta[LSF])
+        if basis is not None:
+            mu = profile_continuum(mu, flux, iv, basis)
         return -0.5 * jnp.sum(iv * (flux - mu) ** 2, axis=-1)
 
     return likelihood_log_prob
@@ -536,18 +705,34 @@ class StabilizedSC(sc.SelfConsistencyLoss):
         data = self._reshape_data(data, samples)
         self._determine_keys(samples, data)
         lml = self._log_marginal_likelihood(data, stage)          # (batch, S)
+        # drop observations with any non-finite draw (rare; v2_giants diverged on one)
+        ok = keras.ops.all(keras.ops.isfinite(lml), axis=1)
+        lml = keras.ops.where(ok[:, None], lml, 0.0)
         if self.n_trim:
             lml = keras.ops.sort(lml, axis=1)[:, self.n_trim:self.num_samples - self.n_trim]
         v = keras.ops.var(lml, axis=1)
+        okf = keras.ops.cast(ok, v.dtype)
+        mean = lambda x: keras.ops.sum(okf * x) / keras.ops.maximum(keras.ops.sum(okf), 1.0)
         if self.mode == "var":
-            loss = keras.ops.mean(v)
+            loss = mean(v)
         elif self.mode == "logvar":
-            loss = keras.ops.mean(keras.ops.log(v + self.eps))
+            loss = mean(keras.ops.log(v + self.eps))
         else:
-            loss = keras.ops.mean(v) / keras.ops.stop_gradient(keras.ops.mean(v) + self.eps)
+            loss = mean(v) / keras.ops.stop_gradient(mean(v) + self.eps)
         sg = keras.ops.stop_gradient
-        return {"loss": self.weight * loss, "raw_var": sg(keras.ops.mean(v)),
-                "lml_std": sg(keras.ops.mean(keras.ops.sqrt(v)))}
+        return {"loss": self.weight * loss, "raw_var": sg(mean(v)),
+                "lml_std": sg(mean(keras.ops.sqrt(v))), "frac_nonfinite": sg(1.0 - keras.ops.mean(okf))}
+
+
+class FiniteAdamW(keras.optimizers.AdamW):
+    """AdamW that skips a step (keeps weights *and* optimizer state) when any
+    gradient is non-finite, so one bad SC batch cannot poison the run."""
+
+    def stateless_apply(self, optimizer_variables, grads, trainable_variables):
+        ok = jnp.all(jnp.stack([jnp.all(jnp.isfinite(g)) for g in grads]))
+        new_tv, new_opt = super().stateless_apply(optimizer_variables, grads, trainable_variables)
+        keep = lambda new, old: [jnp.where(ok, a, b) for a, b in zip(new, old)]
+        return keep(new_tv, trainable_variables), keep(new_opt, optimizer_variables)
 
 
 # =========================================================================
@@ -583,19 +768,53 @@ class SpectrumMLP(bf.networks.SummaryNetwork):
                 "noise_channel": self.noise_channel}
 
 
+class SpectrumTST(bf.networks.SummaryNetwork):
+    """Flat [flux | sigma_feat] (B, 2*N_PIX) -> (B, N_PIX, 3) channels
+    [1 - flux, sigma_feat, good = sigma_feat < 1] -> TimeSeriesTransformer.
+    The mask travels as the `good` channel (TST's mask= is applied before its
+    strided-conv downsampling, so it would not mean what we want)."""
+
+    def __init__(self, summary_dim=64, **tst_kwargs):
+        super().__init__()
+        self.summary_dim, self.tst_kwargs = summary_dim, tst_kwargs
+        self.tst = bf.networks.TimeSeriesTransformer(summary_dim=summary_dim, **tst_kwargs)
+
+    def call(self, x, training=False, **kwargs):
+        flux, sig = x[..., :N_PIX], x[..., N_PIX:]
+        good = keras.ops.cast(sig < 1.0, x.dtype)
+        return self.tst(keras.ops.stack([1.0 - flux, sig, good], axis=-1), training=training)
+
+    def get_config(self):
+        return {"summary_dim": self.summary_dim, **self.tst_kwargs}
+
+
 DEFAULT_NET = dict(hidden=[1024, 512, 256], summary_dim=64, dropout=0.0,
-                   coupling_depth=6, coupling_widths=[256, 256])
+                   coupling_depth=6, coupling_widths=[256, 256], summary="mlp")
+# TST kwargs; override per run with --net '{"summary": "tst", "tst": {"downsample": 32}}'
+DEFAULT_TST = dict(embed_dims=[128, 128, 128], num_heads=[4, 4, 4], downsample=16,
+                   time_embedding="time2vec", dropout=0.05)
 
 
-def build_posterior(net_cfg: dict, noise_channel: bool = False) -> bf.BasicEstimator:
+def summary_net(cfg: dict, noise_channel: bool):
+    if cfg["summary"] == "mlp":
+        return SpectrumMLP(hidden=cfg["hidden"], summary_dim=cfg["summary_dim"],
+                           dropout=cfg["dropout"], noise_channel=noise_channel)
+    if cfg["summary"] == "tst":
+        assert noise_channel, "tst summary needs the sigma_feat channel (noise_channel=True)"
+        kw = DEFAULT_TST | cfg.get("tst", {})
+        return SpectrumTST(summary_dim=cfg["summary_dim"],
+                           **{k: tuple(v) if isinstance(v, list) else v for k, v in kw.items()})
+    raise ValueError(f"unknown summary network {cfg['summary']!r}")
+
+
+def build_posterior(net_cfg: dict, noise_channel: bool = False, names=None) -> bf.BasicEstimator:
     cfg = DEFAULT_NET | (net_cfg or {})
     return bf.BasicEstimator(
         inference_network=bf.networks.CouplingFlow(
             depth=cfg["coupling_depth"],
             subnet_kwargs={"widths": tuple(cfg["coupling_widths"])}),
-        summary_network=SpectrumMLP(hidden=cfg["hidden"], summary_dim=cfg["summary_dim"],
-                                    dropout=cfg["dropout"], noise_channel=noise_channel),
-        adapter=posterior_adapter(noise_channel),
+        summary_network=summary_net(cfg, noise_channel),
+        adapter=posterior_adapter(noise_channel, names),
     )
 
 
@@ -620,26 +839,29 @@ def load_posterior(run_dir: Path, name: str, example_batch: dict):
     """Rebuild the posterior from ``config.json`` and load ``<name>.weights.h5``.
     ``example_batch`` is a shared-adapted batch used to build the layers."""
     cfg = load_run_config(run_dir)
-    posterior = build_posterior(cfg["net"], noise_config(cfg.get("noise"))["noise_channel"])
+    ncfg = noise_config(cfg.get("noise"))
+    posterior = build_posterior(cfg["net"], ncfg["noise_channel"], params(ncfg))
     posterior.build_from_data(posterior.adapter(example_batch))
     posterior.load_weights(Path(run_dir) / f"{name}.weights.h5")
     return posterior
 
 
 def sample_posterior(posterior, adapter, cond: dict, n_samples: int,
-                     batch: int = 256) -> np.ndarray:
-    """Posterior samples in physical label space, shape (n, n_samples, 6).
+                     batch: int = 256, names=None) -> np.ndarray:
+    """Posterior samples in physical label space, shape (n, n_samples, len(names)),
+    ``names`` defaulting to the 6 labels (pass ``params(ncfg)`` to get lsf_px too).
     ``cond``: dict of condition arrays (``flux``, ``log_snr`` [, ``sigma_feat``];
-    ``ivar`` is ignored)."""
-    cond = {k: v for k, v in cond.items() if k != "ivar"}
+    ``ivar`` and a true ``lsf_px`` are ignored)."""
+    names = list(names or LABELS)
+    cond = {k: v for k, v in cond.items() if k not in ("ivar", LSF)}
     n = cond["flux"].shape[0]
-    out = np.empty((n, n_samples, len(LABELS)), "float32")
+    out = np.empty((n, n_samples, len(names)), "float32")
     for s in range(0, n, batch):
         e = min(s + batch, n)
         smp = posterior.sample(num_samples=n_samples, conditions={k: v[s:e] for k, v in cond.items()})
         smp = adapter(smp, inverse=True, strict=False)
         out[s:e] = np.concatenate([np.asarray(smp[k]).reshape(e - s, n_samples, 1)
-                                   for k in LABELS], axis=-1)
+                                   for k in names], axis=-1)
     return out
 
 

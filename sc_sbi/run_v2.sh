@@ -15,7 +15,9 @@ cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 MM_TAG=${MM_TAG:-v1}
 MM=trained_model/sc_sbi/mismatch/$MM_TAG/mismatch.npz
-RUN=${RUN:-v2_full}
+RUN=${RUN:-v2_giants}
+UNL_BATCH=${UNL_BATCH:-64}   # unlabeled spectra per SC step (v1: 32)
+NET=${NET:-'{}'}           # --net JSON overrides, e.g. '{"summary":"tst"}'
 LOGS=trained_model/sc_sbi/logs; mkdir -p "$LOGS"
 
 diagnose() {
@@ -23,14 +25,14 @@ diagnose() {
       --sm-iters 2 --tag "$MM_TAG" 2>&1 | tee "$LOGS/diagnose_$MM_TAG.log"
 }
 train() {
-  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --tag "$RUN" 2>&1 | tee "$LOGS/$RUN.log"
+  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --unlabeled-batch "$UNL_BATCH" --net "$NET" --tag "$RUN" 2>&1 | tee "$LOGS/$RUN.log"
 }
 sanity() {
-  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --init-run "trained_model/sc_sbi/$RUN" \
+  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --unlabeled-batch "$UNL_BATCH" --net "$NET" --init-run "trained_model/sc_sbi/$RUN" \
       --sc-unlabeled korg --no-control --tag "${RUN}_sanity_korg" 2>&1 | tee "$LOGS/${RUN}_sanity_korg.log"
 }
 resid() {
-  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --noise-mode residual \
+  $PY sc_sbi/train.py --preset v2 --mismatch "$MM" --unlabeled-batch "$UNL_BATCH" --net "$NET" --noise-mode residual \
       --tag "${RUN}_resid" 2>&1 | tee "$LOGS/${RUN}_resid.log"
 }
 evaluate() {

@@ -51,6 +51,7 @@ import argparse
 import json
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -68,6 +69,14 @@ PRESETS = {
     "v2": dict(noise_mode="sm", snr_mode="measured", noise_channel=True,
                likelihood_sm=True, sc_loss="logvar", sc_trim=1 / 32, sc_warmup_epochs=5,
                clip="norm", lr_b=3e-5, sc_samples=32, sc_weight=1.0),
+    # v3 = v2 SC settings + L. Branca's forward-model fixes for real BOSS spectra:
+    # per-spectrum Gaussian LSF (lsf_px inferred), Chebyshev-6 continuum profiled in
+    # the SC likelihood (random tilts in the simulations), pipeline-ivar weights only
+    # (no s_m: with LSF + continuum chi2/pix ~ 1), SC stars with <= 30% masked pixels.
+    "v3": dict(noise_mode="template", snr_mode="measured", noise_channel=True,
+               likelihood_sm=False, sc_loss="logvar", sc_trim=1 / 32, sc_warmup_epochs=5,
+               clip="norm", lr_b=3e-5, sc_samples=32, sc_weight=1.0,
+               lsf=True, cont_deg=6, cont_tilt=0.03, sc_max_masked=0.3),
 }
 
 
@@ -96,14 +105,25 @@ class EpochMonitor(keras.callbacks.Callback):
 
     ``<name>_last.weights.h5``    -- last epoch whose loss and weights are finite
     ``<name>_bestval.weights.h5`` -- lowest val NLL so far
+
+    Written every epoch to a *local* temp dir (``$TMPDIR``, default /tmp) -- per-epoch
+    44 MB writes to the NFS run dir stalled training when NFS was congested -- and
+    copied to ``run_dir`` once at the end of the phase (``publish``).
     """
 
     def __init__(self, posterior, val_data, run_dir: Path, name: str):
         super().__init__()
         self.posterior, self.val_data = posterior, val_data
-        self.run_dir, self.name = Path(run_dir), name
+        self.name = name
+        self.final_dir = Path(run_dir)
+        self.run_dir = Path(tempfile.mkdtemp(prefix=f"sc_ckpt_{name}_"))
         self.val_nll, self.best, self.last_finite_epoch = [], np.inf, None
         self.epoch_offset = 0
+
+    def publish(self):
+        for f in self.run_dir.glob("*.weights.h5"):
+            shutil.copy(f, self.final_dir / f.name)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
 
     def on_epoch_end(self, epoch, logs=None):
         e = self.epoch_offset + epoch
@@ -139,7 +159,59 @@ def make_optimizer(lr, epochs, steps_per_epoch, clip, clip_value):
     sched = keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=lr, decay_steps=max(1, epochs * steps_per_epoch))
     kw = {"clipvalue": clip_value} if clip == "value" else {"global_clipnorm": clip_value}
-    return keras.optimizers.AdamW(sched, **kw)
+    return C.FiniteAdamW(sched, **kw)
+
+
+class RecordingMultiDataset(sc.MultiDataset):
+    """MultiDataset that keeps the last few batches by step index (``--debug-nan``)."""
+
+    def __init__(self, keep: int = 520, **datasets):
+        super().__init__(**datasets)
+        self.keep, self.recent = keep, {}
+
+    def __getitem__(self, item):
+        b = super().__getitem__(item)
+        self.recent[item] = b
+        for k in sorted(self.recent)[:-self.keep]:
+            del self.recent[k]
+        return b
+
+
+class NaNDump(keras.callbacks.Callback):
+    """``--debug-nan``: on the first non-finite step, save the batch of that step and
+    the weights from just before it to ``out``, then stop training."""
+
+    def __init__(self, posterior, dataset, out: Path):
+        super().__init__()
+        self.posterior, self.dataset, self.out = posterior, dataset, Path(out)
+        self.prev, self.steps, self.global_step = None, [], 0
+
+    def on_train_batch_end(self, batch, logs=None):
+        logs = {k: float(v) for k, v in (logs or {}).items()}
+        if hasattr(self.model, "jax_state_sync"):
+            self.model.jax_state_sync()      # JAX trainer: push per-step state into the variables
+        self.steps.append({"step": self.global_step, "batch": batch} | logs)
+        self.global_step += 1
+        if np.isfinite(logs.get("loss", np.nan)) and C.weights_finite(self.posterior):
+            self.prev = [np.array(w) for w in self.posterior.get_weights()]
+            return
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / "steps.json").write_text(json.dumps(self.steps, indent=1))
+        item = batch % self.dataset.num_batches
+        if item not in self.dataset.recent:
+            C.log(f"  [debug-nan] batch {item} not recorded; held: {sorted(self.dataset.recent)}")
+            self.model.stop_training = True
+            return
+        b = self.dataset.recent[item]
+        np.savez(self.out / "nan_batch.npz",
+                 **{f"{g}/{k}": np.asarray(v) for g, d in b.items() for k, v in d.items()})
+        (self.out / "steps.json").write_text(json.dumps(self.steps, indent=1))
+        if self.prev is not None:
+            self.posterior.set_weights(self.prev)
+            self.posterior.save_weights(self.out / "pre_nan.weights.h5")
+        C.log(f"  [debug-nan] non-finite at global step {self.global_step - 1} "
+              f"(epoch step {batch}) -> dumped to {self.out}")
+        self.model.stop_training = True
 
 
 def run_phase(estimator, posterior, dataset, *, epochs, lr, steps_per_epoch, args,
@@ -151,6 +223,8 @@ def run_phase(estimator, posterior, dataset, *, epochs, lr, steps_per_epoch, arg
     timer = StepTimer()
     mon = EpochMonitor(posterior, val_data, run_dir, name)
     cbs = [timer, mon, keras.callbacks.TerminateOnNaN()]
+    if args.debug_nan and sc_factory is not None:
+        cbs.append(NaNDump(posterior, dataset, Path(args.debug_nan)))
     C.log(f"phase {name}: {epochs} epochs x {steps_per_epoch} steps, lr={lr:g}, "
           f"clip={args.clip}:{args.clip_value}"
           + (f"  + SC ({args.sc_loss}, trim {args.sc_trim:.3g}, warm-up {warmup})"
@@ -179,12 +253,13 @@ def run_phase(estimator, posterior, dataset, *, epochs, lr, steps_per_epoch, arg
     hist["val_nll"] = mon.val_nll
     # final weights = last finite epoch
     if not C.weights_finite(posterior) or not np.isfinite(hist["loss"][-1]):
-        last = run_dir / f"{name}_last.weights.h5"
+        last = mon.run_dir / f"{name}_last.weights.h5"           # local, see EpochMonitor
         if last.exists():
             C.log(f"  [{name}] non-finite at the end -> restoring epoch "
                   f"{mon.last_finite_epoch + 1}")
             posterior.load_weights(last)
         hist["diverged_at_epoch"] = done
+    mon.publish()
     C.save_posterior(posterior, run_dir, name)
     hist["val_nll_end"] = val_nll_data(posterior, val_data)
     hist["last_finite_epoch"] = None if mon.last_finite_epoch is None else mon.last_finite_epoch + 1
@@ -210,6 +285,8 @@ def parse_args():
     p.add_argument("--steps-per-epoch", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--unlabeled-batch", type=int, default=32)
+    p.add_argument("--sc-logg-max", type=float, default=3.5,
+                   help="SC unlabeled BOSS rows: keep CLAM logg below this (drops dwarfs)")
     p.add_argument("--lr-a", type=float, default=5e-4)
     p.add_argument("--lr-b", type=float)
     p.add_argument("--sigma-floor", type=float, default=0.0)
@@ -223,6 +300,20 @@ def parse_args():
     p.add_argument("--sm-mask-thresh", type=float, default=None,
                    help="mask pixels with s_m above this everywhere")
     p.add_argument("--resid-frac", type=float, default=0.5)
+    # --- v3: forward model ---
+    p.add_argument("--lsf", action=argparse.BooleanOptionalAction, default=False,
+                   help="Gaussian LSF with lsf_px as a 7th posterior parameter")
+    p.add_argument("--lsf-range", type=float, nargs=2, default=(0.3, 4.0),
+                   help="lsf_px prior box [pixels]")
+    p.add_argument("--cont-deg", type=int, default=0,
+                   help="SC likelihood: profiled Chebyshev continuum degree (0 = off)")
+    p.add_argument("--cont-tilt", type=float, default=0.0,
+                   help="simulations: random Chebyshev continuum, coefficient std (0 = off)")
+    p.add_argument("--log-params", nargs="+", default=list(C.LOG_LABELS),
+                   help="parameters log-transformed before the bounded logit (network "
+                        "parametrisation only; the prior stays the grid's)")
+    p.add_argument("--sc-max-masked", type=float, default=1.0,
+                   help="SC unlabeled BOSS rows: drop spectra with more masked pixels than this")
     # --- v2: SC loss / optimiser ---
     p.add_argument("--sc-loss", choices=["var", "logvar", "normvar"])
     p.add_argument("--sc-trim", type=float)
@@ -243,6 +334,8 @@ def parse_args():
     p.add_argument("--net", type=json.loads, default={},
                    help=f"JSON overrides of {C.DEFAULT_NET}")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--debug-nan", default=None,
+                   help="dir: on the first non-finite SC step dump batch + pre-step weights, stop")
     p.add_argument("--outdir", default=str(C.PROJECT_ROOT / "trained_model/sc_sbi"))
     p.add_argument("--tag", default=None)
     p.add_argument("--smoke", action="store_true",
@@ -274,12 +367,16 @@ def main():
                            "mismatch": args.mismatch, "sm_scale": args.sm_scale,
                            "sm_mask_thresh": args.sm_mask_thresh,
                            "likelihood_sm": bool(args.likelihood_sm),
-                           "resid_frac": args.resid_frac})
+                           "resid_frac": args.resid_frac,
+                           "lsf": bool(args.lsf), "lsf_range": list(args.lsf_range),
+                           "cont_deg": args.cont_deg, "cont_tilt": args.cont_tilt})
     mm = C.load_mismatch(ncfg)
     C.log(f"noise config: {ncfg}")
 
     # ---- data -------------------------------------------------------------
     box = C.label_box(args.korg_cache)
+    if ncfg["lsf"]:
+        box[C.LSF] = tuple(ncfg["lsf_range"])
     pbox = C.padded_box(box)
     C.log("loading Korg cache ...")
     korg, kidx, _ = C.load_korg(args.korg_cache, max_rows=args.max_rows, seed=0,
@@ -291,13 +388,17 @@ def main():
     ok = C.boss_in_box(boss, box)
     tmpl_tr = np.flatnonzero((boss["split"] == 0) & np.isfinite(boss["snr"]) & (boss["snr"] > 0))
     tmpl_va = np.flatnonzero((boss["split"] == 1) & np.isfinite(boss["snr"]) & (boss["snr"] > 0))
-    sc_rows = np.flatnonzero((boss["split"] == 0) & ok)
+    # SC only on CLAM giants: Korg+emulator badly reproduce BOSS dwarfs (diagnose: logg off by 1-3 dex)
+    frac_masked = (boss["ivar"] <= 0).mean(1)
+    sc_rows = np.flatnonzero((boss["split"] == 0) & ok & (boss["labels"][:, 1] < args.sc_logg_max)
+                             & (frac_masked <= args.sc_max_masked))
     rng = np.random.default_rng(args.seed)
     if args.boss_max_rows and sc_rows.size > args.boss_max_rows:
         sc_rows = np.sort(rng.choice(sc_rows, args.boss_max_rows, replace=False))
         tmpl_tr = np.sort(rng.choice(tmpl_tr, min(tmpl_tr.size, args.boss_max_rows), replace=False))
     C.log(f"BOSS: noise templates {tmpl_tr.size:,} (train split), "
-          f"SC unlabeled {sc_rows.size:,} (train split, in box)")
+          f"SC unlabeled {sc_rows.size:,} (train split, in box, CLAM logg < {args.sc_logg_max}, "
+          f"masked <= {args.sc_max_masked:.0%})")
     bank_kw = {}
     if ncfg["mode"] == "residual":
         assert np.all(boss["split"][mm.bank_rows] == 0), "residual bank must be train split"
@@ -308,7 +409,7 @@ def main():
     noise_val = C.NoiseModel(C.NoiseTemplates(boss["ivar"][tmpl_va], boss["snr"][tmpl_va]),
                              ncfg | {"mode": "sm" if ncfg["mode"] == "residual" else ncfg["mode"]}, mm)
 
-    adapter = C.shared_adapter(pbox)
+    adapter = C.shared_adapter(pbox, args.log_params)
     lab = C.KorgNoisyDataset(Ltr, Ftr, noise, args.batch_size, args.steps_per_epoch,
                              adapter, seed=args.seed)
     if args.sc_unlabeled == "korg":
@@ -318,7 +419,8 @@ def main():
         unl = C.BossDataset(boss["flux"][sc_rows], boss["ivar"][sc_rows], boss["snr"][sc_rows],
                             args.unlabeled_batch, args.steps_per_epoch, adapter,
                             seed=args.seed + 1, ncfg=ncfg, mm=mm)
-    dataset = sc.MultiDataset(labeled=lab, unlabeled=unl)
+    dataset = (RecordingMultiDataset(labeled=lab, unlabeled=unl) if args.debug_nan
+               else sc.MultiDataset(labeled=lab, unlabeled=unl))
 
     nv = min(args.n_val, Lva.shape[0])
     val_data = val_batch(adapter, Lva[:nv], Fva[:nv], noise_val)
@@ -327,10 +429,12 @@ def main():
     likelihood = C.make_likelihood(
         C.make_emulator_fn(args.emulator), args.sigma_floor,
         s_m=mm.s_m if (mm is not None and ncfg["likelihood_sm"]) else None,
-        pixel_mask=mm.mask if (mm is not None and mm.mask.any()) else None)
+        pixel_mask=mm.mask if (mm is not None and mm.mask.any()) else None,
+        lsf=ncfg["lsf"], cont_deg=ncfg["cont_deg"])
 
     config = {"args": vars(args), "box": box, "padded_box": pbox,
-              "net": C.DEFAULT_NET | args.net, "labels": C.LABELS, "noise": ncfg,
+              "net": C.DEFAULT_NET | args.net, "labels": C.params(ncfg), "noise": ncfg,
+              "log_params": list(args.log_params),
               "korg_cache": args.korg_cache, "emulator": args.emulator, "code_version": 2}
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
     np.savez(run_dir / "splits.npz", korg_test_idx=kidx["test"], korg_val_idx=kidx["val"],
@@ -350,9 +454,11 @@ def main():
     if args.init_run:
         src = Path(args.init_run)
         src_cfg = C.load_run_config(src)
-        assert src_cfg["net"] == config["net"], "net config differs from --init-run"
+        assert C.DEFAULT_NET | src_cfg["net"] == config["net"], "net config differs from --init-run"
         assert (C.noise_config(src_cfg.get("noise"))["noise_channel"] == ncfg["noise_channel"]), \
             "noise_channel differs from --init-run"
+        assert src_cfg.get("log_params", C.LOG_LABELS) == list(args.log_params), \
+            "log_params differ from --init-run"
         shutil.copy(src / "amortized.weights.h5", run_dir / "amortized.weights.h5")
         for f in ("history.json", "timing.json"):
             if (src / f).exists():
@@ -360,7 +466,7 @@ def main():
                 (history if f == "history.json" else timing)["amortized"] = d
         C.log(f"phase A skipped: amortized weights from {src}")
     else:
-        posterior = C.build_posterior(config["net"], ncfg["noise_channel"])
+        posterior = C.build_posterior(config["net"], ncfg["noise_channel"], C.params(ncfg))
         est = C.build_estimator(posterior, adapter, likelihood)
         history["amortized"], timing["amortized"] = run_phase(
             est, posterior, dataset, epochs=args.epochs_a, lr=args.lr_a,
