@@ -341,9 +341,13 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
     model, payload = load_checkpoint(run_dir / "best.pkl")
     y_mean = np.asarray(payload["y_mean"], np.float32)
     y_std = np.asarray(payload["y_std"], np.float32)
+    # a run trained on a label subset (e.g. 4 labels): feed it only its columns
+    # (per-column standardisation is the same train rows, so slicing is exact)
+    cols = [ds.feature_names.index(n) for n in payload["feature_names"]]
+    Xm = Xn if len(cols) == Xn.shape[1] else Xn[:, cols]
 
     metrics, persp = training.full_reconstruction_metrics(
-        model, Xn, ds.Y, Yn, test_idx, ds.y_std, ds.y_mean, BATCH)
+        model, Xm, ds.Y, Yn, test_idx, ds.y_std, ds.y_mean, BATCH)
     (run_dir / "reconstruction_stats_full.json").write_text(
         json.dumps({"test_set": metrics}, indent=2))
     print(f"[eval] {tag}: R2={metrics['r2']:.6f} "
@@ -377,7 +381,7 @@ def evaluate_run(run_dir: Path, tag: str, ds, Xn, Yn, outdir: Path,
     order = np.argsort(persp)
 
     def predict_row(g):
-        yn = np.asarray(model(jnp.asarray(Xn[g:g + 1])))[0]
+        yn = np.asarray(model(jnp.asarray(Xm[g:g + 1])))[0]
         return yn * y_std + y_mean, ds.Y[g]
 
     def lab(g):

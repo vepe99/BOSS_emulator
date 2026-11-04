@@ -272,7 +272,10 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
     # The host copies Xn/Yn are kept only for the end-of-trial test-set metrics
     # (full_reconstruction_metrics), which run once, not per epoch.
     Xtr = jax.device_put(Xn[ds.train_idx])
-    Ytr = jax.device_put(Yn[ds.train_idx])
+    # ponytail: --host-targets keeps train targets on the host and copies each
+    # batch (~73 MB) to the GPU, for cards that can't hold the ~8.5 GB split.
+    host_y = getattr(args, "host_targets", False)
+    Ytr = None if host_y else jax.device_put(Yn[ds.train_idx])
     train_pos = np.arange(ds.train_idx.size)
     Xva = jax.device_put(Xn[ds.val_idx])
     Yva = jax.device_put(Yn[ds.val_idx])
@@ -330,7 +333,8 @@ def train(args, prepared=None, trial=None) -> tuple[Path, "data_mod.Dataset", fl
                 # Positions index the device-resident train split; permuting
                 # positions with the same seed reproduces the exact same
                 # batches as permuting the global row indices did.
-                loss = train_step(model, optimizer, Xtr[batch], Ytr[batch])
+                yb = Yn[ds.train_idx[batch]] if host_y else Ytr[batch]
+                loss = train_step(model, optimizer, Xtr[batch], yb)
                 train_losses.append(loss)  # device scalar; reduced once/epoch
 
             # Validation (batched, device-resident). Switch to eval mode so
@@ -516,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-standardize-y", action="store_true",
                    dest="no_standardize_y",
                    help="do not per-pixel standardise the target")
+    p.add_argument("--host-targets", action="store_true", dest="host_targets",
+                   help="keep train targets on host, copy per batch (low-memory GPUs)")
     p.add_argument("--rebuild-cache", action="store_true", dest="rebuild_cache")
     p.add_argument("--outdir", default=str(data_mod.PROJECT_ROOT / "trained_model"))
     p.add_argument("--list-abundances", action="store_true",
