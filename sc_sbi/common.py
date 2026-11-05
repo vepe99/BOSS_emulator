@@ -162,6 +162,19 @@ def _prepare_boss(npz=BOSS_NPZ, out=BOSS_PREPARED, seed=0,
         f"{n_tr}/{n_va}/{uniq.size - n_tr - n_va})")
 
 
+BANK_DEFAULT = PROJECT_ROOT / "sc_sbi/cache/speclite_bank_v6_2_1.npz"
+LOGLAM0 = 3.5523                           # BOSS / Korg grid: log10(lambda) = LOGLAM0 + 1e-4 * px
+WAVE = (10 ** (LOGLAM0 + 1e-4 * np.arange(N_PIX))).astype("float64")   # [A], rest frame
+
+
+def load_bank(path=BANK_DEFAULT) -> dict:
+    """v4 spec-lite bank from ``build_wdisp_bank.py``: same keys as ``load_boss`` (flux,
+    ivar, labels, e_labels, snr, sdss_id, data_type, telescope, split) -- one rest-frame,
+    continuum-normalised DR20 visit per star -- plus ``wdisp`` (n, N_PIX) and ``lsf_pca``."""
+    z = np.load(path, allow_pickle=False)
+    return {k: z[k] for k in z.files}
+
+
 def load_boss(path=BOSS_PREPARED) -> dict:
     """Prepared BOSS arrays (built on first use). ``split``: 0 train, 1 val, 2 test."""
     path = Path(path)
@@ -199,9 +212,11 @@ def boss_in_box(boss: dict, box: dict) -> np.ndarray:
 class NoiseTemplates:
     """Real BOSS (ivar, mask, SNR) triples used to noise simulated spectra (v1)."""
 
-    def __init__(self, ivar: np.ndarray, snr: np.ndarray):
+    def __init__(self, ivar: np.ndarray, snr: np.ndarray, wdisp: np.ndarray | None = None,
+                 lsf_pca: np.ndarray | None = None):
         self.ivar = ivar
         self.snr = snr
+        self.wdisp, self.lsf_pca = wdisp, lsf_pca      # v4: real LSF of the same star (joint draw)
         self.sigma = np.where(ivar > 0, 1.0 / np.sqrt(np.maximum(ivar, 1e-30)), 0.0).astype("float32")
 
     def __len__(self):
@@ -235,12 +250,16 @@ NOISE_DEFAULTS = {
     "lsf_range": [0.3, 4.0],   # lsf_px prior box [pixels]
     "cont_deg": 0,             # SC likelihood: profile a Chebyshev continuum of this degree
     "cont_tilt": 0.0,          # simulations: random multiplicative Chebyshev continuum, coef std
+    # --- v4: real per-star LSF (lsf="wdisp"): Vedant's stretch+FFT method with that star's WDISP
+    "bank": None,              # build_wdisp_bank.py output (templates, WDISP, SC + test spectra)
+    "lsf_kappa": 1.1,          # WDISP calibration factor (LSF_vedant.py)
+    "lsf_rgrid": 5000.0,       # Korg grid resolution lambda/FWHM
 }
 
 
 def params(ncfg: dict | None) -> list:
     """Posterior parameters: the 6 emulator labels (+ lsf_px with the v3 LSF)."""
-    return LABELS + ([LSF] if noise_config(ncfg)["lsf"] else [])
+    return LABELS + ([LSF] if noise_config(ncfg)["lsf"] is True else [])   # v4 "wdisp": LSF known
 
 
 # ---- v3 forward model ------------------------------------------------------
@@ -264,6 +283,41 @@ def apply_lsf(flux, sigma):
     for j in range(2 * K_HALF + 1):
         out = out + w[..., j] * pad[:, j:j + flux.shape[1]]
     return out
+
+
+LN10E4 = np.log(10) * 1e-4
+VEDANT_NX = 32768          # >= 2**ceil(log2(2 / x_per_sigma)) of LSF_vedant.py for every bank WDISP
+
+
+def vedant_lsf(flux, wdisp, kappa=1.1, r_grid=5000.0, nx=VEDANT_NX):
+    """Korg flux on the BOSS grid (``WAVE``, R = ``r_grid``) -> BOSS LSF given by ``wdisp``.
+
+    JAX/vmap transcription of ``sc_sbi/LSF_vedant.py`` (same math): kernel sigma
+    sigma_k^2 = sigma_lsf^2 + dlambda^2/12 - (lambda / (R * 2.3548))^2 (floored at
+    (0.1 sigma_lsf)^2), sigma_lsf = kappa ln10 1e-4 WDISP lambda; stretch lambda so sigma_k
+    is constant (cdf of dlambda/sigma_k), FFT-convolve with a Gaussian, interpolate back.
+    The only change: ``nx`` is fixed (jit) instead of 2**ceil(log2(2/x_per_sigma)); it is
+    at least that large, i.e. the stretched grid is at least as fine.
+    ``flux`` (n, P), ``wdisp`` (n, P) [1e-4 dex px] -> (n, P)."""
+    W = jnp.asarray(WAVE[:flux.shape[1]], jnp.float32)
+    DW = jnp.gradient(W)
+    U = jnp.linspace(0.0, 1.0, nx, dtype=jnp.float32)
+    k2 = jnp.arange(nx // 2 + 1, dtype=jnp.float32) ** 2
+    Rs = r_grid * 2.3548
+
+    def one(fm, wd):
+        s_lsf = kappa * LN10E4 * wd * W
+        sk = jnp.sqrt(jnp.maximum(s_lsf ** 2 + DW ** 2 / 12 - (W / Rs) ** 2, (0.1 * s_lsf) ** 2))
+        g = DW / sk
+        cdf = jnp.cumsum(g)
+        cdf = cdf / cdf[-1]
+        xps = jnp.median(jnp.gradient(cdf) / g)
+        lam = jnp.interp(U, cdf, W)
+        fx = jnp.interp(lam, W, fm)
+        f = jnp.fft.irfft(jnp.fft.rfft(fx) * jnp.exp(-2 * jnp.pi ** 2 * xps ** 2 * k2), n=nx)
+        return jnp.interp(W, lam, f)
+
+    return jax.vmap(one)(jnp.asarray(flux, jnp.float32), jnp.asarray(wdisp, jnp.float32))
 
 
 def korg_lsf_sigma(wdisp, kappa=1.1, r_grid=5000.0, point_sampled=True):
@@ -297,7 +351,7 @@ def draw_forward_aug(ncfg: dict, n: int, rng: np.random.Generator):
     ``coefs`` (n, deg+1) of a multiplicative Chebyshev continuum
     ``1 + sum_j a_j T_j`` with ``a_j ~ N(0, cont_tilt / (j + 1))`` or None."""
     c = noise_config(ncfg)
-    lsf = (rng.uniform(*c["lsf_range"], size=n).astype("float32") if c["lsf"] else None)
+    lsf = (rng.uniform(*c["lsf_range"], size=n).astype("float32") if c["lsf"] is True else None)
     coefs = None
     if c["cont_tilt"] > 0:
         deg = max(int(c["cont_deg"]), 1)
@@ -410,10 +464,17 @@ class NoiseModel:
     def make_batch(self, flux, labels, rng):
         n = flux.shape[0]
         lsf, coefs = draw_forward_aug(self.cfg, n, rng)
+        wd = self.t.wdisp is not None
+        if wd:                                   # v4: the template star's own LSF, before the tilt
+            j = rng.integers(0, len(self.t), size=n)
+            flux = np.concatenate([np.asarray(vedant_lsf(flux[s:s + 512], self.t.wdisp[j[s:s + 512]],
+                                                         self.cfg["lsf_kappa"], self.cfg["lsf_rgrid"]))
+                                   for s in range(0, n, 512)])
         if lsf is not None or coefs is not None:
             basis = jnp.asarray(cheb_basis(coefs.shape[1] - 1)) if coefs is not None else None
             flux = np.asarray(forward_aug(jnp.asarray(flux), lsf, coefs, basis))
-        j = rng.integers(0, len(self.t), size=n)
+        if not wd:
+            j = rng.integers(0, len(self.t), size=n)
         iv = self.t.ivar[j].copy()
         snr = self.t.snr[j].copy()
         eps = rng.standard_normal(flux.shape, dtype="float32") * self.t.sigma[j]
@@ -435,6 +496,8 @@ class NoiseModel:
         out = spectrum_features(noisy, iv, snr, self.cfg, self.mm)
         if lsf is not None:
             out[LSF] = lsf[:, None]
+        if wd:
+            out["wdisp"], out["lsf_pca"] = self.t.wdisp[j], self.t.lsf_pca[j].astype("float32")
         return out
 
 
@@ -444,14 +507,18 @@ def label_dict(labels: np.ndarray) -> dict:
 
 @jax.jit
 def _gpu_noisy_batch(key, flux_all, ivar_t, sig_t, snr_t, i, j, s_m_noise, s_m_feat, mask,
-                     measured, aug=(None, None, None)):
+                     measured, aug=(None, None, None), wdisp_t=None, pca_t=None, lsf_k=(1.1, 5000.0)):
     """GPU twin of ``NoiseModel.make_batch`` (template / sm) + ``spectrum_features``.
+    ``flux_all`` may be float16 (cast here); ``sig_t`` scales the photon noise (1 = on, 0 = off).
     One Gaussian draw with sigma = sqrt(sigma_photon^2 + s_m^2) == the two
     independent draws of the CPU path. ``measured`` is a traced bool; sigma_feat
     is always computed (the caller drops it without ``noise_channel``)."""
-    f, iv, snr = flux_all[i], ivar_t[j], snr_t[j]
+    f, iv, snr = flux_all[i].astype(jnp.float32), ivar_t[j], snr_t[j]
+    if wdisp_t is not None:                     # v4: real LSF of template star j (Vedant)
+        f = vedant_lsf(f, wdisp_t[j], *lsf_k)
     f = forward_aug(f, *aug)                    # v3: LSF + continuum tilt (no-op otherwise)
-    sig = jnp.sqrt(sig_t[j] ** 2 + s_m_noise[None] ** 2)
+    photon = jnp.where(iv > 0, jax.lax.rsqrt(jnp.maximum(iv, 1e-30)), 0.0)   # sigma from ivar per batch
+    sig = jnp.sqrt((sig_t * photon) ** 2 + s_m_noise[None] ** 2)         # sig_t: scalar noise scale
     noisy = f + jax.random.normal(key, f.shape, f.dtype) * sig
     noisy = jnp.where(iv > 0, noisy, 1.0)
     iv = jnp.where(mask[None], 0.0, iv)
@@ -463,6 +530,8 @@ def _gpu_noisy_batch(key, flux_all, ivar_t, sig_t, snr_t, i, j, s_m_noise, s_m_f
     out = {"flux": noisy, "ivar": iv, "log_snr": jnp.log10(jnp.maximum(snr, 1e-3))[:, None]}
     sf = jnp.sqrt(jnp.where(good, 1.0 / jnp.maximum(iv, 1e-30), 1.0) + s_m_feat[None] ** 2)
     out["sigma_feat"] = jnp.where(good, jnp.minimum(sf, 1.0), 1.0)
+    if wdisp_t is not None:
+        out["wdisp"], out["lsf_pca"] = wdisp_t[j], pca_t[j]
     return out
 
 
@@ -488,12 +557,17 @@ class KorgNoisyDataset(keras.utils.PyDataset):
             zero = np.zeros(N_PIX, "float32")
             s_m = zero if mm is None else mm.s_m
             self.dev = dict(
-                flux_all=jax.device_put(flux), ivar_t=jax.device_put(t.ivar),
-                sig_t=jax.device_put(t.sigma), snr_t=jax.device_put(t.snr.astype("float32")),
+                # GPU memory (11 GB cards): Korg flux as float16 (step 1e-3 << noise; cast per
+                # batch), photon sigma recomputed from ivar per batch (sig_t = scalar scale, 1)
+                flux_all=jax.device_put(flux.astype("float16")), ivar_t=jax.device_put(t.ivar),
+                sig_t=jnp.float32(1.0), snr_t=jax.device_put(t.snr.astype("float32")),
                 s_m_noise=jnp.asarray(s_m if templates.mode == "sm" else zero),
                 s_m_feat=jnp.asarray(s_m),
                 mask=jnp.asarray(np.zeros(N_PIX, bool) if mm is None else mm.mask),
                 measured=jnp.asarray(cfg["snr_mode"] == "measured"))
+            if t.wdisp is not None:
+                self.dev |= dict(wdisp_t=jax.device_put(t.wdisp), pca_t=jax.device_put(t.lsf_pca.astype("float32")),
+                                 lsf_k=(float(cfg["lsf_kappa"]), float(cfg["lsf_rgrid"])))
             self.noise_channel = bool(cfg["noise_channel"])
             self.key, self.calls = jax.random.key(seed), 0
             self.basis = (jnp.asarray(cheb_basis(max(int(cfg["cont_deg"]), 1)))
@@ -535,9 +609,11 @@ class BossDataset(keras.utils.PyDataset):
 
     def __init__(self, flux, ivar, snr, batch_size: int, num_batches: int,
                  adapter, seed: int = 1, ncfg: dict | None = None,
-                 mm: Mismatch | None = None, **kwargs):
+                 mm: Mismatch | None = None, wdisp=None, lsf_pca=None, **kwargs):
         super().__init__(**kwargs)
         feats = spectrum_features(flux, ivar, snr, ncfg, mm)
+        if wdisp is not None:                   # v4: each spectrum's own LSF
+            feats |= {"wdisp": wdisp, "lsf_pca": lsf_pca.astype("float32")}
         self.feats = {k: jax.device_put(v) for k, v in feats.items()}
         self.n = feats["flux"].shape[0]
         self.batch_size, self._num_batches, self.adapter = batch_size, num_batches, adapter
@@ -594,12 +670,14 @@ def shared_adapter(pbox: dict, log_params=None) -> bf.Adapter:
     return a
 
 
-def posterior_adapter(noise_channel: bool = False, names=None) -> bf.Adapter:
-    a = bf.Adapter().drop("ivar").concatenate(list(names or LABELS), into="inference_variables")
+def posterior_adapter(noise_channel: bool = False, names=None, lsf_pca: bool = False) -> bf.Adapter:
+    a = bf.Adapter().drop("ivar").drop("wdisp").concatenate(list(names or LABELS), into="inference_variables")
     if noise_channel:   # summary input = [flux | sigma_feat], shape (n, 2 * N_PIX)
         a = a.concatenate(["flux", "sigma_feat"], into="summary_variables")
     else:
         a = a.rename("flux", "summary_variables")
+    if lsf_pca:         # v4: condition on the known LSF (PCA coefficients of WDISP)
+        return a.concatenate(["log_snr", "lsf_pca"], into="inference_conditions")
     return a.rename("log_snr", "inference_conditions")
 
 
@@ -629,7 +707,8 @@ def make_emulator_fn(ckpt=EMULATOR_CKPT):
 
 
 def make_likelihood(emulator_fn, sigma_floor: float = 0.0, s_m: np.ndarray | None = None,
-                    pixel_mask: np.ndarray | None = None, lsf: bool = False, cont_deg: int = 0):
+                    pixel_mask: np.ndarray | None = None, lsf: bool | str = False, cont_deg: int = 0,
+                    lsf_kappa: float = 1.1, lsf_rgrid: float = 5000.0):
     """``log p(y | theta) = -1/2 sum ivar_eff (y - emu(theta))^2`` (unnormalised).
 
     ``ivar_eff = ivar / (1 + ivar * (floor^2 + s_m^2))``: an optional scalar
@@ -653,8 +732,10 @@ def make_likelihood(emulator_fn, sigma_floor: float = 0.0, s_m: np.ndarray | Non
         th = jnp.concatenate([jnp.reshape(theta[k], (-1, 1)) for k in LABELS], axis=1)
         mu = emulator_fn(th.astype(jnp.float32))
         iv = ivar if plain else keep_j * ivar / (1.0 + ivar * extra_j)
-        if lsf:
+        if lsf is True:
             mu = apply_lsf(mu, theta[LSF])
+        elif lsf == "wdisp":                    # v4: the spectrum's own LSF (data key "wdisp")
+            mu = vedant_lsf(mu, theta["wdisp"], lsf_kappa, lsf_rgrid)
         if basis is not None:
             mu = profile_continuum(mu, flux, iv, basis)
         return -0.5 * jnp.sum(iv * (flux - mu) ** 2, axis=-1)
@@ -807,14 +888,15 @@ def summary_net(cfg: dict, noise_channel: bool):
     raise ValueError(f"unknown summary network {cfg['summary']!r}")
 
 
-def build_posterior(net_cfg: dict, noise_channel: bool = False, names=None) -> bf.BasicEstimator:
+def build_posterior(net_cfg: dict, noise_channel: bool = False, names=None,
+                    lsf_pca: bool = False) -> bf.BasicEstimator:
     cfg = DEFAULT_NET | (net_cfg or {})
     return bf.BasicEstimator(
         inference_network=bf.networks.CouplingFlow(
             depth=cfg["coupling_depth"],
             subnet_kwargs={"widths": tuple(cfg["coupling_widths"])}),
         summary_network=summary_net(cfg, noise_channel),
-        adapter=posterior_adapter(noise_channel, names),
+        adapter=posterior_adapter(noise_channel, names, lsf_pca),
     )
 
 
@@ -840,7 +922,7 @@ def load_posterior(run_dir: Path, name: str, example_batch: dict):
     ``example_batch`` is a shared-adapted batch used to build the layers."""
     cfg = load_run_config(run_dir)
     ncfg = noise_config(cfg.get("noise"))
-    posterior = build_posterior(cfg["net"], ncfg["noise_channel"], params(ncfg))
+    posterior = build_posterior(cfg["net"], ncfg["noise_channel"], params(ncfg), ncfg["lsf"] == "wdisp")
     posterior.build_from_data(posterior.adapter(example_batch))
     posterior.load_weights(Path(run_dir) / f"{name}.weights.h5")
     return posterior
@@ -853,7 +935,7 @@ def sample_posterior(posterior, adapter, cond: dict, n_samples: int,
     ``cond``: dict of condition arrays (``flux``, ``log_snr`` [, ``sigma_feat``];
     ``ivar`` and a true ``lsf_px`` are ignored)."""
     names = list(names or LABELS)
-    cond = {k: v for k, v in cond.items() if k not in ("ivar", LSF)}
+    cond = {k: v for k, v in cond.items() if k not in ("ivar", LSF, "wdisp")}
     n = cond["flux"].shape[0]
     out = np.empty((n, n_samples, len(names)), "float32")
     for s in range(0, n, batch):

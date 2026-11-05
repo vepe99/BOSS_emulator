@@ -42,7 +42,7 @@ lsf, coefs = C.draw_forward_aug(ncfg, 8, np.random.default_rng(5))
 g = C._gpu_noisy_batch(C.jax.random.key(0), i=i, j=i, aug=(lsf, coefs, ds.basis), **ds.dev)
 ref = np.asarray(C.forward_aug(jnp.asarray(F[i]), lsf, coefs, jnp.asarray(C.cheb_basis(6))))
 ref = np.where(iv[i] > 0, ref, 1.0)
-assert np.allclose(np.asarray(g["flux"]), ref, atol=1e-5), "GPU vs CPU forward"
+assert np.allclose(np.asarray(g["flux"]), ref, atol=1e-3), "GPU vs CPU forward"  # GPU Korg flux is float16
 b = ds[0]
 assert b[C.LSF].shape == (8, 1) and np.all((np.asarray(b[C.LSF]) > -10) & (np.asarray(b[C.LSF]) < 10))
 assert C.params(ncfg)[-1] == C.LSF and len(C.params(ncfg)) == 7

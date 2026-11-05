@@ -77,6 +77,15 @@ PRESETS = {
                likelihood_sm=False, sc_loss="logvar", sc_trim=1 / 32, sc_warmup_epochs=5,
                clip="norm", lr_b=3e-5, sc_samples=32, sc_weight=1.0,
                lsf=True, cont_deg=6, cont_tilt=0.03, sc_max_masked=0.3),
+    # v4 = v3 with the *real* per-star LSF instead of a free Gaussian lsf_px: noise template
+    # and WDISP drawn jointly from one DR20 spec-lite star (bank from build_wdisp_bank.py),
+    # convolved with Vedant's stretch+FFT method; the posterior is conditioned on the WDISP
+    # PCA coefficients; SC on --sc-n spec-lite spectra with their own WDISP.
+    "v4": dict(noise_mode="template", snr_mode="measured", noise_channel=True,
+               likelihood_sm=False, sc_loss="logvar", sc_trim=1 / 32, sc_warmup_epochs=5,
+               clip="norm", lr_b=3e-5, sc_samples=32, sc_weight=1.0,
+               lsf=False, cont_deg=6, cont_tilt=0.03, sc_max_masked=0.3,
+               wdisp_bank=str(C.BANK_DEFAULT), sc_n=5000),
 }
 
 
@@ -305,6 +314,10 @@ def parse_args():
                    help="Gaussian LSF with lsf_px as a 7th posterior parameter")
     p.add_argument("--lsf-range", type=float, nargs=2, default=(0.3, 4.0),
                    help="lsf_px prior box [pixels]")
+    p.add_argument("--wdisp-bank", default=None,
+                   help="v4: spec-lite bank (build_wdisp_bank.py) -> real per-star LSF, templates, SC data")
+    p.add_argument("--lsf-kappa", type=float, default=1.1, help="v4: WDISP calibration factor")
+    p.add_argument("--sc-n", type=int, default=None, help="SC unlabeled spectra: random subset of this size")
     p.add_argument("--cont-deg", type=int, default=0,
                    help="SC likelihood: profiled Chebyshev continuum degree (0 = off)")
     p.add_argument("--cont-tilt", type=float, default=0.0,
@@ -368,14 +381,16 @@ def main():
                            "sm_mask_thresh": args.sm_mask_thresh,
                            "likelihood_sm": bool(args.likelihood_sm),
                            "resid_frac": args.resid_frac,
-                           "lsf": bool(args.lsf), "lsf_range": list(args.lsf_range),
+                           "lsf": "wdisp" if args.wdisp_bank else bool(args.lsf),
+                           "lsf_range": list(args.lsf_range), "bank": args.wdisp_bank,
+                           "lsf_kappa": args.lsf_kappa,
                            "cont_deg": args.cont_deg, "cont_tilt": args.cont_tilt})
     mm = C.load_mismatch(ncfg)
     C.log(f"noise config: {ncfg}")
 
     # ---- data -------------------------------------------------------------
     box = C.label_box(args.korg_cache)
-    if ncfg["lsf"]:
+    if ncfg["lsf"] is True:
         box[C.LSF] = tuple(ncfg["lsf_range"])
     pbox = C.padded_box(box)
     C.log("loading Korg cache ...")
@@ -384,7 +399,8 @@ def main():
     (Ltr, Ftr), (Lva, Fva) = korg["train"], korg["val"]
     C.log(f"Korg train {Ltr.shape[0]:,}  val {Lva.shape[0]:,}")
 
-    boss = C.load_boss()
+    wd = ncfg["lsf"] == "wdisp"
+    boss = C.load_bank(ncfg["bank"]) if wd else C.load_boss()     # v4: one spec-lite visit per star
     ok = C.boss_in_box(boss, box)
     tmpl_tr = np.flatnonzero((boss["split"] == 0) & np.isfinite(boss["snr"]) & (boss["snr"] > 0))
     tmpl_va = np.flatnonzero((boss["split"] == 1) & np.isfinite(boss["snr"]) & (boss["snr"] > 0))
@@ -393,6 +409,8 @@ def main():
     sc_rows = np.flatnonzero((boss["split"] == 0) & ok & (boss["labels"][:, 1] < args.sc_logg_max)
                              & (frac_masked <= args.sc_max_masked))
     rng = np.random.default_rng(args.seed)
+    if args.sc_n and sc_rows.size > args.sc_n:
+        sc_rows = np.sort(rng.choice(sc_rows, args.sc_n, replace=False))
     if args.boss_max_rows and sc_rows.size > args.boss_max_rows:
         sc_rows = np.sort(rng.choice(sc_rows, args.boss_max_rows, replace=False))
         tmpl_tr = np.sort(rng.choice(tmpl_tr, min(tmpl_tr.size, args.boss_max_rows), replace=False))
@@ -403,10 +421,11 @@ def main():
     if ncfg["mode"] == "residual":
         assert np.all(boss["split"][mm.bank_rows] == 0), "residual bank must be train split"
         bank_kw = dict(bank_ivar=boss["ivar"][mm.bank_rows], bank_snr=boss["snr"][mm.bank_rows])
-    noise = C.NoiseModel(C.NoiseTemplates(boss["ivar"][tmpl_tr], boss["snr"][tmpl_tr]),
+    tkw = lambda r: dict(wdisp=boss["wdisp"][r], lsf_pca=boss["lsf_pca"][r]) if wd else {}
+    noise = C.NoiseModel(C.NoiseTemplates(boss["ivar"][tmpl_tr], boss["snr"][tmpl_tr], **tkw(tmpl_tr)),
                          ncfg, mm, **bank_kw)
     # validation noise: val-split templates, no residual bank (template [+ s_m])
-    noise_val = C.NoiseModel(C.NoiseTemplates(boss["ivar"][tmpl_va], boss["snr"][tmpl_va]),
+    noise_val = C.NoiseModel(C.NoiseTemplates(boss["ivar"][tmpl_va], boss["snr"][tmpl_va], **tkw(tmpl_va)),
                              ncfg | {"mode": "sm" if ncfg["mode"] == "residual" else ncfg["mode"]}, mm)
 
     adapter = C.shared_adapter(pbox, args.log_params)
@@ -418,7 +437,7 @@ def main():
     else:
         unl = C.BossDataset(boss["flux"][sc_rows], boss["ivar"][sc_rows], boss["snr"][sc_rows],
                             args.unlabeled_batch, args.steps_per_epoch, adapter,
-                            seed=args.seed + 1, ncfg=ncfg, mm=mm)
+                            seed=args.seed + 1, ncfg=ncfg, mm=mm, **tkw(sc_rows))
     dataset = (RecordingMultiDataset(labeled=lab, unlabeled=unl) if args.debug_nan
                else sc.MultiDataset(labeled=lab, unlabeled=unl))
 
@@ -430,7 +449,8 @@ def main():
         C.make_emulator_fn(args.emulator), args.sigma_floor,
         s_m=mm.s_m if (mm is not None and ncfg["likelihood_sm"]) else None,
         pixel_mask=mm.mask if (mm is not None and mm.mask.any()) else None,
-        lsf=ncfg["lsf"], cont_deg=ncfg["cont_deg"])
+        lsf=ncfg["lsf"], cont_deg=ncfg["cont_deg"], lsf_kappa=ncfg["lsf_kappa"],
+        lsf_rgrid=ncfg["lsf_rgrid"])
 
     config = {"args": vars(args), "box": box, "padded_box": pbox,
               "net": C.DEFAULT_NET | args.net, "labels": C.params(ncfg), "noise": ncfg,
@@ -466,7 +486,7 @@ def main():
                 (history if f == "history.json" else timing)["amortized"] = d
         C.log(f"phase A skipped: amortized weights from {src}")
     else:
-        posterior = C.build_posterior(config["net"], ncfg["noise_channel"], C.params(ncfg))
+        posterior = C.build_posterior(config["net"], ncfg["noise_channel"], C.params(ncfg), wd)
         est = C.build_estimator(posterior, adapter, likelihood)
         history["amortized"], timing["amortized"] = run_phase(
             est, posterior, dataset, epochs=args.epochs_a, lr=args.lr_a,

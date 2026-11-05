@@ -120,15 +120,20 @@ def prior_variance(box, n=400_000, seed=0):
     return v
 
 
-def make_chi2(emulator_fn, cont_deg: int = 0):
+def make_chi2(emulator_fn, cont_deg: int = 0, ncfg: dict | None = None):
     """chi2/pixel of the run's forward model at the posterior median: emulator
-    [-> LSF of sigma ``lsf``] [-> profiled Chebyshev continuum] (v3)."""
+    [-> LSF: Gaussian of sigma ``lsf`` (v3) or, v4, Vedant's method with WDISP ``lsf``]
+    [-> profiled Chebyshev continuum]."""
     basis = jnp.asarray(C.cheb_basis(cont_deg)) if cont_deg > 0 else None
+    ncfg = C.noise_config(ncfg)
+    wd = ncfg["lsf"] == "wdisp"
 
     @jax.jit
     def chi2(theta, flux, ivar, lsf):
         mu = emulator_fn(theta)
-        if lsf is not None:
+        if lsf is not None and wd:
+            mu = C.vedant_lsf(mu, lsf, ncfg["lsf_kappa"], ncfg["lsf_rgrid"])
+        elif lsf is not None:
             mu = C.apply_lsf(mu, lsf)
         if basis is not None:
             mu = C.profile_continuum(mu, flux, ivar, basis)
@@ -224,6 +229,40 @@ def plot_sbc(ranks, labels, models, path):
     axes[0, 0].set_ylabel("ECDF − uniform")
     axes[0, 0].legend(fontsize=7)
     fig.suptitle("Korg test: SBC rank ECDF difference (grey: 95 % KS band)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+CAL_LEVELS = np.linspace(0.05, 0.95, 19)
+
+
+def calibration_curve(samples, ref):
+    """Fraction of references inside the central credible interval, per nominal level."""
+    ok = np.isfinite(ref)
+    s, r = samples[ok], ref[ok]
+    if r.size == 0:
+        return np.full(CAL_LEVELS.size, np.nan)
+    out = []
+    for lev in CAL_LEVELS:
+        lo, hi = np.percentile(s, [50 - 50 * lev, 50 + 50 * lev], axis=1)
+        out.append(np.mean((r >= lo) & (r <= hi)))
+    return np.array(out)
+
+
+def plot_calibration(cal, labels, models, path, title):
+    """cal[m]: (len(CAL_LEVELS), len(labels)) empirical coverage."""
+    fig, axes = plt.subplots(1, len(labels), figsize=(3.0 * len(labels), 3.0), squeeze=False)
+    for c, k in enumerate(labels):
+        ax = axes[0, c]
+        ax.plot([0, 1], [0, 1], "k:", lw=0.8)
+        for m in models:
+            ax.plot(CAL_LEVELS, cal[m][:, c], "o-", ms=2.5, color=COLORS[m], label=m)
+        ax.set_title(k)
+        ax.set_xlabel("nominal credible level")
+    axes[0, 0].set_ylabel("empirical coverage")
+    axes[0, 0].legend(fontsize=7)
+    fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -341,10 +380,18 @@ def main():
                         f"({', '.join(REF_FLOOR_PRESETS)}) or 'Teff=100,logg=0.1,...'")
     p.add_argument("--no-ppc", action="store_true", help="skip the emulator chi2 check")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--boss-source", choices=["auto", "bank", "clam"], default="auto",
+                   help="v4 runs: 'bank' = spec-lite visits with their own WDISP (default), "
+                        "'clam' = boss_clam coadds with the WDISP of the star's bank visit")
+    p.add_argument("--out", default=None, help="eval dir name (default eval, eval_clam for clam on v4)")
+    p.add_argument("--cut-mdwarfs", action="store_true",
+                   help="drop BOSS test stars with reference Teff < 4000 and logg >= 4")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
-    out = run_dir / "eval"
+    cfg0 = C.noise_config(C.load_run_config(run_dir).get("noise"))
+    src = args.boss_source if args.boss_source != "auto" else ("bank" if cfg0["lsf"] == "wdisp" else "clam")
+    out = run_dir / (args.out or ("eval_clam" if (src == "clam" and cfg0["lsf"] == "wdisp") else "eval"))
     out.mkdir(exist_ok=True)
     cfg = C.load_run_config(run_dir)
     ncfg = C.noise_config(cfg.get("noise"))
@@ -372,9 +419,28 @@ def main():
     if args.n_korg and args.n_korg < Lk.shape[0]:
         sel = np.sort(rng.choice(Lk.shape[0], args.n_korg, replace=False))
         Lk, Fk = Lk[sel], Fk[sel]
-    boss = C.load_boss()
-    t_rows = np.flatnonzero((boss["split"] == 2) & np.isfinite(boss["snr"]) & (boss["snr"] > 0))
-    tmpl = C.NoiseTemplates(boss["ivar"][t_rows], boss["snr"][t_rows])
+    wd = ncfg["lsf"] == "wdisp"
+    bank = C.load_bank(ncfg["bank"]) if wd else None            # v4: spec-lite + own WDISP
+    tsrc = bank if wd else C.load_boss()                         # Korg-test noise (+ LSF) templates
+    t_rows = np.flatnonzero((tsrc["split"] == 2) & np.isfinite(tsrc["snr"]) & (tsrc["snr"] > 0))
+    tkw = dict(wdisp=bank["wdisp"][t_rows], lsf_pca=bank["lsf_pca"][t_rows]) if wd else {}
+    tmpl = C.NoiseTemplates(tsrc["ivar"][t_rows], tsrc["snr"][t_rows], **tkw)
+    if src == "bank":
+        boss, has = tsrc, np.ones(tsrc["split"].size, bool)
+    else:                                                        # boss_clam coadds
+        boss = tsrc if not wd else C.load_boss()
+        has = np.ones(boss["split"].size, bool)
+        if wd:      # each star's WDISP / PCA from its bank visit (coadd LSF ~ visit LSF)
+            pos = {int(v): i for i, v in enumerate(bank["sdss_id"])}
+            bi = np.array([pos.get(int(v), -1) for v in boss["sdss_id"]])
+            has = bi >= 0
+            boss["wdisp"] = np.where(has[:, None], bank["wdisp"][np.maximum(bi, 0)], 1.0).astype("float16")
+            boss["lsf_pca"] = np.where(has[:, None], bank["lsf_pca"][np.maximum(bi, 0)], 0.0).astype("float32")
+    if args.cut_mdwarfs:
+        Lr = boss["labels"]
+        has &= ~((Lr[:, 0] < 4000) & (Lr[:, 1] >= 4))
+    lsfkw = lambda r: dict(wdisp=boss["wdisp"][r], lsf_pca=boss["lsf_pca"][r]) if wd else {}
+    C.log(f"BOSS source: {src} ({'spec-lite visits' if src == 'bank' else 'boss_clam coadds'}) -> {out}")
     # residual mode trains with a bank of *train* residuals; the test set uses template + s_m
     korg_noise = C.NoiseModel(tmpl, ncfg | {"mode": "sm" if ncfg["mode"] == "residual"
                                             else ncfg["mode"]}, mm)
@@ -383,33 +449,34 @@ def main():
     C.log(f"Korg test: {Lk.shape[0]:,} spectra (noise from {t_rows.size:,} BOSS test templates)")
 
     # ---- BOSS test ----------------------------------------------------------
-    rows = np.flatnonzero((boss["split"] == 2) & C.boss_in_box(boss, box))
+    rows = np.flatnonzero((boss["split"] == 2) & C.boss_in_box(boss, box) & has)
     if args.n_boss and args.n_boss < rows.size:
         rows = np.sort(rng.choice(rows, args.n_boss, replace=False))
     Lb, Eb = boss["labels"][rows], boss["e_labels"][rows]
     Sb = boss["snr"][rows]
-    cond_b = C.spectrum_features(boss["flux"][rows], boss["ivar"][rows], Sb, ncfg, mm)
+    cond_b = C.spectrum_features(boss["flux"][rows], boss["ivar"][rows], Sb, ncfg, mm) | lsfkw(rows)
     dtype_b = boss["data_type"][rows].astype(str)
     C.log(f"BOSS test: {rows.size:,} spectra (test-split stars, in box)")
     bcols = [C.LABELS.index(k) for k in C.BOSS_LABELS]
     regions = {name: f(Lb[:, 0], Lb[:, 1]) for name, f in HR_REGIONS.items()}
 
     pairs = repeat_pairs(boss, box, args.n_repeat_stars, rng) if args.n_repeat_stars else np.zeros((0, 2), int)
+    pairs = pairs[has[pairs].all(1)] if len(pairs) else pairs
     if len(pairs):
         pr = pairs.reshape(-1)
-        cond_r = C.spectrum_features(boss["flux"][pr], boss["ivar"][pr], boss["snr"][pr], ncfg, mm)
+        cond_r = C.spectrum_features(boss["flux"][pr], boss["ivar"][pr], boss["snr"][pr], ncfg, mm) | lsfkw(pr)
         C.log(f"repeat check: {len(pairs)} test stars x 2 spectra")
 
     example = adapter(C.label_dict(Lk[:2]) | {k: v[:2] for k, v in cond_k.items()})
     pvar = prior_variance(box)
-    chi2_fn = None if args.no_ppc else make_chi2(C.make_emulator_fn(cfg["emulator"]), ncfg["cont_deg"])
+    chi2_fn = None if args.no_ppc else make_chi2(C.make_emulator_fn(cfg["emulator"]), ncfg["cont_deg"], ncfg)
     names = C.params(ncfg)                      # 6 labels (+ lsf_px for v3, scored separately)
     lsf_true_k = cond_k.get(C.LSF)
 
     metrics = {"config": {"n_korg": int(Lk.shape[0]), "n_boss": int(rows.size),
                           "n_repeat_stars": int(len(pairs)), "n_samples": args.n_samples,
                           "models": models, "noise": ncfg, "ref_floor": floor}}
-    med_k, med_b, ranks_k, chi2_k, chi2_b = {}, {}, {}, {}, {}
+    med_k, med_b, ranks_k, chi2_k, chi2_b, cal_k, cal_b = {}, {}, {}, {}, {}, {}, {}
     for m in models:
         C.log(f"[{m}] sampling ...")
         post = C.load_posterior(run_dir, m, example)
@@ -418,12 +485,15 @@ def main():
         sk = C.sample_posterior(post, adapter, cond_k, args.n_samples, names=names)
         sb = C.sample_posterior(post, adapter, cond_b, args.n_samples, names=names)
         lsf_k = lsf_b = None
-        if ncfg["lsf"]:                         # lsf_px: nuisance, kept out of the label metrics
+        if ncfg["lsf"] is True:                 # lsf_px: nuisance, kept out of the label metrics
             lsf_k, lsf_b = np.median(sk[..., -1], 1), np.median(sb[..., -1], 1)
             sk, sb = sk[..., :-1], sb[..., :-1]
         Sk, Sbb = summarize(sk), summarize(sb)
         med_k[m], med_b[m] = Sk["median"], Sbb["median"][:, bcols]
         ranks_k[m] = np.stack([sbc_ranks(sk[:, :, i], Lk[:, i]) for i in range(len(C.LABELS))], 1)
+        cal_k[m] = np.stack([calibration_curve(sk[:, :, i], Lk[:, i]) for i in range(len(C.LABELS))], 1)
+        cal_b[m] = np.stack([calibration_curve(sb[:, :, C.LABELS.index(k)], Lb[:, j])
+                             for j, k in enumerate(C.BOSS_LABELS)], 1)
 
         mk = {}
         for i, k in enumerate(C.LABELS):
@@ -453,7 +523,10 @@ def main():
                 r: point_metrics(med[msk], ref[msk])
                 | {"cov68_with_floor": z_metrics(med[msk], sd[msk], ref[msk], err[msk], floor[k])["cov68"]}
                 for r, msk in regions.items()}
-        metrics[m] = {"korg": mk, "boss": mb}
+        metrics[m] = {"korg": mk, "boss": mb,
+                      "calibration": {"levels": CAL_LEVELS.tolist(),
+                                      "korg": dict(zip(C.LABELS, cal_k[m].T.tolist())),
+                                      "boss": dict(zip(C.BOSS_LABELS, cal_b[m].T.tolist()))}}
 
         if len(pairs):
             sr = C.sample_posterior(post, adapter, cond_r, args.n_samples)
@@ -469,6 +542,8 @@ def main():
             metrics[m]["repeat"] = rep
 
         if chi2_fn is not None:
+            if wd:                              # v4: the known LSF of each spectrum
+                lsf_k, lsf_b = cond_k["wdisp"], cond_b["wdisp"]
             chi2_k[m] = chi2_fn(Sk["median"], cond_k["flux"], cond_k["ivar"], lsf=lsf_k)
             chi2_b[m] = chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"], lsf=lsf_b)
             metrics[m]["korg_chi2_median"] = float(np.nanmedian(chi2_k[m]))
@@ -476,7 +551,7 @@ def main():
             if mm is not None:
                 metrics[m]["boss_chi2_sm_median"] = float(np.nanmedian(
                     chi2_fn(Sbb["median"], cond_b["flux"], cond_b["ivar"], s_m=mm.s_m, lsf=lsf_b)))
-        if lsf_k is not None:
+        if lsf_k is not None and not wd:
             t = np.asarray(lsf_true_k).ravel()
             metrics[m]["lsf"] = {"korg_mae": float(np.mean(np.abs(lsf_k - t))),
                                  "korg_bias": float(np.mean(lsf_k - t)),
@@ -545,6 +620,9 @@ def main():
     plot_recovery(Lb, med_b, C.BOSS_LABELS, models, out / "boss_recovery.png",
                   "BOSS test (reference labels)")
     plot_sbc(ranks_k, C.LABELS, models, out / "korg_sbc.png")
+    plot_calibration(cal_k, C.LABELS, models, out / "korg_calibration.png", "Korg test: calibration")
+    plot_calibration(cal_b, C.BOSS_LABELS, models, out / "boss_calibration.png",
+                     f"BOSS test ({src}): calibration vs reference labels (posterior only, no ref. error)")
     plot_err_vs_snr(Lk, med_k, snr_k, C.LABELS, models, out / "korg_err_vs_snr.png", "Korg test")
     plot_err_vs_snr(Lb, med_b, Sb, C.BOSS_LABELS, models, out / "boss_err_vs_snr.png", "BOSS test")
     if chi2_fn is not None:
