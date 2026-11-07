@@ -36,6 +36,8 @@ p.add_argument("--lr", type=float, default=0.05)
 p.add_argument("--batch", type=int, default=500)
 p.add_argument("--out", default="map_clam")
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--init", choices=["npe", "random"], default="npe",
+               help="Adam start: NPE posterior median (warm) or a uniform draw in the prior box (log-uniform vmic)")
 p.add_argument("--cut-mdwarfs", action="store_true", help="drop reference Teff < 4000 & logg >= 4")
 p.add_argument("--match-eval-korg", type=int, default=0,
                help="reproduce evaluate.py's star draw: its --n-korg (rng draws the Korg subset first)")
@@ -76,6 +78,14 @@ post = C.load_posterior(run_dir, a.model, ex)
 smp = C.sample_posterior(post, adapter, cond, a.n_samples)
 npe = np.median(smp, 1)
 C.log("NPE sampled")
+if a.init == "random":
+    blo, bhi = np.array([box[k][0] for k in C.LABELS]), np.array([box[k][1] for k in C.LABELS])
+    x_start = blo + (bhi - blo) * rng.uniform(size=(rows.size, 6))
+    vi = C.LABELS.index("vmic")
+    x_start[:, vi] = np.exp(np.log(blo[vi]) + (np.log(bhi[vi]) - np.log(blo[vi])) * rng.uniform(size=rows.size))
+    x_start = x_start.astype("float32")
+else:
+    x_start = npe
 
 # ---- 2. MAP by Adam from the NPE median (logit-bounded box)
 lo = jnp.array([box[k][0] for k in C.LABELS]); hi = jnp.array([box[k][1] for k in C.LABELS])
@@ -112,7 +122,7 @@ mp, c0, c1 = [], [], []
 for s in range(0, rows.size, a.batch):
     idx = np.minimum(np.arange(s, s + a.batch), rows.size - 1)   # pad the last batch: one compile
     k = min(a.batch, rows.size - s)
-    r = fit(jnp.asarray(npe[idx]), jnp.asarray(flux[idx]), jnp.asarray(ivar[idx]), jnp.asarray(wdisp[idx]))
+    r = fit(jnp.asarray(x_start[idx]), jnp.asarray(flux[idx]), jnp.asarray(ivar[idx]), jnp.asarray(wdisp[idx]))
     mp.append(np.asarray(r[0])[:k]); c0.append(np.asarray(r[1])[:k]); c1.append(np.asarray(r[2])[:k])
     C.log(f"  MAP {min(s + a.batch, rows.size)}/{rows.size}")
 mp, c0, c1 = np.concatenate(mp), np.concatenate(c0), np.concatenate(c1)
@@ -132,7 +142,7 @@ for name, m in [("all", np.ones_like(mdw)), ("no_mdwarf", ~mdw), ("mdwarf", mdw)
                  "npe": mae(npe[:, cols], m), "map": mae(mp[:, cols], m),
                  "chi2pix_npe": float(np.median(chi_npe[m])), "chi2pix_map": float(np.median(chi_map[m]))}
 json.dump(res, open(out / "metrics.json", "w"), indent=1)
-np.savez(out / "map_results.npz", rows=rows, sdss_id=boss["sdss_id"][rows], ref=ref, npe=npe, map=mp,
+np.savez(out / "map_results.npz", init=a.init, x_start=x_start, rows=rows, sdss_id=boss["sdss_id"][rows], ref=ref, npe=npe, map=mp,
          chi2pix_npe=chi_npe, chi2pix_map=chi_map, npe_std=smp.std(1))
 
 lines = [f"# NPE ({a.model}) -> MAP, {rows.size} boss_clam test coadds, Vedant LSF\n",
